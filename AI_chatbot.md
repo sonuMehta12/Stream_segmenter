@@ -1,6 +1,6 @@
 # Pet Health Companion — System Design Document
 
-> **Version:** 1.0
+> **Version:** 1.1
 > **Date:** 2026-02-24
 > **Status:** Draft
 
@@ -12,6 +12,7 @@
 2. [System Architecture Diagram](#2-system-architecture-diagram)
 3. [Data Flow Diagram (Sequence)](#3-data-flow-diagram-sequence)
 4. [Core Agents — The Three-Agent Pipeline](#4-core-agents--the-three-agent-pipeline)
+   - 4.4 [Context Building Strategy](#44-context-building-strategy)
 5. [Data Architecture](#5-data-architecture)
 6. [Confidence Bar — Calculation Logic](#6-confidence-bar--calculation-logic)
 7. [Information Priority Schema](#7-information-priority-schema)
@@ -19,9 +20,10 @@
 9. [Redirection Logic — Guardrails & Deep Links](#9-redirection-logic--guardrails--deep-links)
 10. [Passive Context Gathering](#10-passive-context-gathering)
 11. [Conversation Context Management](#11-conversation-context-management)
-12. [Quality Assurance & Filters](#12-quality-assurance--filters)
+12. [Quality Assurance & Filters (Three-Layer Defense)](#12-quality-assurance--filters)
 13. [User Onboarding Flow](#13-user-onboarding-flow)
 14. [Future Roadmap](#14-future-roadmap)
+15. [Appendix A: Technology Stack](#appendix-a-technology-stack)
 
 ---
 
@@ -62,14 +64,14 @@ graph TB
     subgraph AGENTS["🤖 Three-Agent Pipeline"]
         direction TB
         A1["Agent 1: Conversation Agent<br/>─────────────────────<br/>Model: GPT-4o / Claude 3.5 Sonnet<br/>Role: Empathetic response generation<br/>Inputs: user_msg, active_profile,<br/>compressed_history, gap_list"]
-        A2["Agent 2: Compressor<br/>─────────────────────<br/>Model: GPT-4o-mini / Haiku<br/>Role: Extract structured facts from<br/>natural language as JSON<br/>Output: key, value, confidence,<br/>source_quote"]
+        A2["Agent 2: Compressor<br/>─────────────────────<br/>Regex gate → skip if no entities<br/>Model: GPT-4o-mini / Haiku<br/>Role: Extract structured facts as JSON<br/>Output: key, value, confidence,<br/>source_quote"]
         A3["Agent 3: Aggregator<br/>─────────────────────<br/>Role: Merge new facts with existing<br/>profile, resolve conflicts via recency<br/>+ confidence + user correction<br/>Compute gap priorities"]
     end
 
     subgraph DATA["🗄️ Data Layer"]
         PG_LOG["PostgreSQL: fact_log<br/>─────────────────────<br/>Append-only table<br/>Columns: pet_id, key, value,<br/>confidence, source, source_quote,<br/>created_at<br/>Index: (pet_id, key, created_at DESC)"]
         PG_PROFILE["PostgreSQL: active_profile<br/>─────────────────────<br/>Computed view table<br/>Columns: pet_id, key, value,<br/>confidence, updated_at, fact_log_id<br/>PK: (pet_id, key) — UPSERT"]
-        REDIS["Redis Cache<br/>─────────────────────<br/>Key: pet:{pet_id}:summary<br/>Value: ~900 token NL summary<br/>TTL: 24 hours<br/>Target: < 100ms retrieval"]
+        REDIS["Redis Cache<br/>─────────────────────<br/>pet:{id}:active_profile → JSON (TTL 1h)<br/>pet:{id}:profile_summary → NL text (TTL 24h)<br/>Target: < 100ms retrieval"]
     end
 
     subgraph MODULES["📦 Specialized Modules (External)"]
@@ -96,8 +98,8 @@ graph TB
     A3 -->|"trigger"| CONFCALC
     CONFCALC -->|"read profile"| PG_PROFILE
     CONFCALC -->|"update score"| CB
-    A3 -->|"regenerate NL summary"| REDIS
-    A1 -->|"read active profile"| PG_PROFILE
+    A3 -->|"update active_profile + profile_summary"| REDIS
+    A1 -->|"read active_profile (cached)"| REDIS
     A1 -->|"raw response"| GUARD
     GUARD -->|"filtered response"| API
     API -->|"response + confidence score"| USER
@@ -143,24 +145,24 @@ sequenceDiagram
     Note over User, ConfCalc: ══════ PHASE 1: Context Loading ══════
 
     User ->> API: Send message ("Luna seems tired today")
-    API ->> API: Authenticate + rate limit
-    API ->> PG_P: Fetch active_profile (pet_id)
-    PG_P -->> API: {diet: "raw food", energy: "moderate", meds: "antibiotics", ...}
-    API ->> API: Load compressed_history + gap_list
-    API ->> A1: {user_msg, active_profile, compressed_history, gap_list}
+    API ->> API: Authenticate + rate limit + classify intent (regex)
+    API ->> Redis: GET pet:p1:active_profile
+    Redis -->> API: {diet: "raw food", energy: "moderate", meds: "antibiotics", ...}
+    API ->> API: Load compressed_history (PostgreSQL) + compute gap_list
+    API ->> A1: {user_msg, active_profile, compressed_history, gap_list, intent_flag}
 
     Note over User, ConfCalc: ══════ PHASE 2: Response Generation ══════
 
     A1 ->> A1: Generate empathetic response<br/>considering profile + history + gaps
-    A1 ->> Guard: Raw response text
-    Guard ->> Guard: Check for medical jargon ❌<br/>Check for robotic tone ❌<br/>Check for medical intent ❌
+    A1 ->> Guard: Raw response JSON (message + intent_flag)
+    Guard ->> Guard: Layer 3: Regex check for medical jargon ❌<br/>Check for robotic tone ❌<br/>Check for preachy language ❌
     Guard -->> API: Filtered response ✅
     API -->> User: "Oh, Luna's feeling a bit low energy today?<br/>That can happen ~ Has she been eating okay?"
 
     Note over User, ConfCalc: ══════ PHASE 3: Fact Extraction (Async) ══════
 
-    API -) A2: {user_msg: "Luna seems tired today"} (async)
-    A2 ->> A2: Extract structured facts from natural language
+    API -) A2: Regex gate: "tired" matches entity pattern → proceed
+    A2 ->> A2: Extract structured facts via LLM
     A2 -->> A3: [{key: "energy", value: "low/tired",<br/>confidence: 0.75, source_quote: "seems tired today"}]
 
     Note over User, ConfCalc: ══════ PHASE 4: Data Persistence ══════
@@ -173,7 +175,8 @@ sequenceDiagram
 
     Note over User, ConfCalc: ══════ PHASE 5: Cache & Score Update ══════
 
-    A3 -) Redis: Regenerate NL summary → SET pet:p1:summary "..." EX 86400
+    A3 -) Redis: SET pet:p1:active_profile (updated JSON)
+    A3 -) Redis: Rebuild profile_summary (template current + cached history)
     A3 -) ConfCalc: Trigger recalculation
     ConfCalc ->> PG_P: Read full active_profile for pet
     ConfCalc ->> ConfCalc: Coverage × 0.4 + Recency × 0.3 + Depth × 0.3
@@ -229,19 +232,19 @@ sequenceDiagram
     participant Summary as 📝 Summary<br/>Generator
 
     Health ->> API: GET /pet/p1/context
-    API ->> Redis: GET pet:p1:summary
+    API ->> Redis: GET pet:p1:profile_summary
 
     alt Cache HIT (< 5ms)
-        Redis -->> API: "Luna is a 2-year-old Shiba Inu..."
-        API -->> Health: {summary: "...", confidence_score: 72, last_updated: "..."}
+        Redis -->> API: "CURRENT STATE: Luna is a 2yo Shiba Inu...\nHEALTH HISTORY: Mar 2024..."
+        API -->> Health: {profile_summary: "...", confidence_score: 72, last_updated: "..."}
     else Cache MISS (TTL expired or first request)
         Redis -->> API: null
         API ->> PG_P: SELECT * FROM active_profile WHERE pet_id = 'p1'
         PG_P -->> API: [{key: diet_type, value: raw food, ...}, ...]
-        API ->> Summary: Generate NL summary from profile rows
-        Summary -->> API: "Luna is a 2-year-old Shiba Inu who eats raw food..."
-        API ->> Redis: SET pet:p1:summary "..." EX 86400
-        API -->> Health: {summary: "...", confidence_score: 72, last_updated: "..."}
+        API ->> Summary: Template current state + use cached history section
+        Summary -->> API: "CURRENT STATE: ...\nHEALTH HISTORY: ..."
+        API ->> Redis: SET pet:p1:profile_summary "..." EX 86400
+        API -->> Health: {profile_summary: "...", confidence_score: 72, last_updated: "..."}
     end
 ```
 
@@ -274,8 +277,13 @@ sequenceDiagram
 
         A3 ->> PG_L: APPEND fact (source = "passive")
         A3 ->> PG_P: Compare + UPSERT if new info is better
-        A3 ->> Redis: Regenerate NL summary for this pet
+        A3 ->> Redis: Update active_profile cache
     end
+
+    Note over Cron, Redis: After all pets processed:
+
+    Cron ->> Redis: Regenerate history section from fact_log (LLM)
+    Cron ->> Redis: Rebuild full profile_summary (template + new history)
 
     Note over Cron, Redis: Next morning, Conversation Agent<br/>already knows about the new medication!
 ```
@@ -294,23 +302,60 @@ sequenceDiagram
 | **Output** | Natural language response (passed through guardrail filter before reaching user) |
 | **Key Constraint** | Ask only 1–3 questions per session. Never force consecutive questions. |
 
-**What goes into the prompt:**
+**Prompt Template:**
+
+```
+SYSTEM:
+You are a warm, friendly pet companion for {{pet_name}}, a {{age}} {{breed}} {{species}}.
+You are NOT a vet. You NEVER diagnose, prescribe, or give medical/nutritional advice.
+
+## Character Rules
+- Use gentle sentence endings like "~maybe!" and "~"
+- Never be preachy, robotic, or judgmental
+- Ask at most {{max_questions}} questions this session
+- If user mentions anything medical/health-related, respond with empathy ONLY
+  and set intent_flag to "medical" or "nutritional" in your response JSON
+
+## Pet Profile (current)
+{{active_profile_formatted}}
+
+## Information Gaps (pick 1-2 to naturally ask about)
+{{gap_list}}
+
+## Relationship Context
+{{compressed_history}}
+
+## Current Session
+{{current_session_messages}}
+
+Respond in JSON format:
+{
+  "message": "your response text",
+  "intent_flag": "general" | "medical" | "nutritional",
+  "questions_asked_count": number
+}
+
+USER: {{user_message}}
+```
+
+**What goes into the prompt (token budget):**
 
 ```
 System Prompt:
-├── Character guidelines (warm, friendly, not childish, no jargon)
-├── Active Profile (~200-500 tokens)
+├── Character guidelines (~150 tokens, static)
+├── Active Profile (~200-500 tokens, from Redis)
 │   ├── Pet: Luna, Shiba Inu, 2 years
 │   ├── Diet: raw food (conf: 0.95)
 │   ├── Energy: low/tired (conf: 0.75, today)
 │   └── Medication: antibiotics (conf: 0.85)
-├── Gap List (1-3 highest priority unknowns)
+├── Gap List (~50-100 tokens, computed)
 │   ├── Feeding frequency (Rank A, never asked)
 │   └── Exercise level (Rank B, 45 days stale)
-└── Compressed History (~200-400 tokens)
-    └── "Last session: user was worried about appetite. Seemed anxious."
+├── Compressed History (~200-400 tokens, from PostgreSQL)
+│   └── "Last session: user was worried about appetite. Seemed anxious."
+└── Current session messages (~200-500 tokens, last N turns)
 
-Total context: ~800-1200 tokens — well within limits
+Total context: ~800-1500 tokens — well within limits
 ```
 
 ### 4.2 Agent 2: Compressor
@@ -321,6 +366,58 @@ Total context: ~800-1200 tokens — well within limits
 | **Model** | GPT-4o-mini or Claude Haiku (fast, cheap — this is a structured extraction task) |
 | **Input** | Raw user message text |
 | **Output** | Array of `{key, value, confidence, source_quote}` |
+
+#### Regex Pre-filter (Skip unnecessary LLM calls)
+
+Before calling the Compressor LLM, a simple regex check determines if the message contains any extractable entities. Messages like "ok", "thanks", "haha" are skipped entirely — no LLM cost.
+
+```python
+ENTITY_PATTERNS = [
+    r"\b(eat|ate|food|kibble|raw|diet|feed|meal|treat)\b",
+    r"\b(tired|energy|sleep|active|lazy|playful|lethargic)\b",
+    r"\b(vet|medicine|pill|medication|antibiotics|vaccine)\b",
+    r"\b(walk|exercise|run|play|park)\b",
+    r"\b(weight|gained|lost|kg|pounds|fat|thin)\b",
+    r"\b(poop|pee|toilet|bathroom|diarrhea|constipat)\b",
+    r"\b(groom|bath|brush|fur|coat|shed)\b",
+    r"\b(scared|anxious|aggressive|shy|friendly|bark)\b",
+    r"\b(vomit|bleed|lump|limp|swollen|cough|sneez)\b",
+    r"\b(allerg|itch|scratch|rash|skin)\b",
+]
+
+def has_extractable_entities(message: str) -> bool:
+    return any(re.search(p, message, re.IGNORECASE) for p in ENTITY_PATTERNS)
+
+# Usage:
+# "Luna seems tired today" → True (matches "tired") → call Compressor
+# "haha okay thanks!"      → False                  → skip Compressor
+```
+
+**Why regex and not an LLM gate:** An LLM call to decide whether to make another LLM call adds cost, latency, and a failure point. The Compressor model (Haiku) costs ~$0.0001 per call — the savings from an LLM gate are negligible. A regex check is free, instant (~1ms), and catches 40-60% of casual messages.
+
+#### Compressor Prompt Template
+
+```
+SYSTEM:
+Extract structured facts from this pet conversation message.
+For each fact, provide:
+- key: one of [diet_type, feeding_frequency, appetite, energy_level,
+  sleep_pattern, chronic_conditions, medications, recent_symptoms,
+  exercise_level, weight_change, personality, home_alone_frequency,
+  toilet_timing, grooming_frequency, favorite_toys, vet_visits]
+- value: the extracted information
+- confidence: 0.0-1.0 (how certain this is what the user meant)
+- source_quote: exact words from the message that support this
+
+Rules:
+- Only extract what is explicitly stated or strongly implied
+- Casual mentions get lower confidence (e.g., 0.5-0.6)
+- Definitive statements get higher confidence (e.g., 0.8-0.95)
+- If user says "Actually, X" — mark source as "user_correction"
+- Return empty array [] if nothing is extractable
+
+USER: {{user_message}}
+```
 
 **Extraction categories:**
 
@@ -400,6 +497,81 @@ function aggregate(newFact, currentEntry):
     // The new fact is still in fact_log for audit
 ```
 
+### 4.4 Context Building Strategy
+
+This is the logic that assembles everything Agent 1 needs before each response. It runs on every user message.
+
+```python
+async def build_agent_context(pet_id: str, session_id: str, user_message: str) -> dict:
+    """Build the full context for Agent 1 (Conversation Agent)."""
+
+    # Step 1: Get active profile from Redis (fast path)
+    profile_json = await redis.get(f"pet:{pet_id}:active_profile")
+    if not profile_json:
+        # Cache miss — read from PostgreSQL, re-cache
+        profile_rows = await db.query(
+            "SELECT key, value, confidence, updated_at FROM active_profile WHERE pet_id = $1",
+            pet_id
+        )
+        profile_json = serialize(profile_rows)
+        await redis.set(f"pet:{pet_id}:active_profile", profile_json, ex=3600)
+
+    active_profile = deserialize(profile_json)
+
+    # Step 2: Get compressed history (latest compaction from PostgreSQL)
+    compressed = await db.query_one(
+        "SELECT summary FROM compressed_history WHERE pet_id = $1 ORDER BY created_at DESC LIMIT 1",
+        pet_id
+    )
+
+    # Step 3: Get current session messages (only this session, not all history)
+    session_msgs = await db.query(
+        "SELECT role, content FROM conversation_log WHERE session_id = $1 ORDER BY created_at",
+        session_id
+    )
+
+    # Step 4: Compute gap list from active_profile vs priority schema
+    all_priority_keys = get_priority_keys_by_rank()  # Rank A → B → C
+    filled_keys = {row["key"] for row in active_profile}
+    missing = [k for k in all_priority_keys if k not in filled_keys]
+
+    pet = await db.query_one("SELECT life_stage FROM pet WHERE id = $1", pet_id)
+    stale = [
+        row for row in active_profile
+        if is_stale(row["updated_at"], pet["life_stage"])
+    ]
+    stale_keys = [row["key"] for row in stale]
+
+    gap_list = (missing + stale_keys)[:3]  # Top 3 gaps for this session
+
+    # Step 5: Assemble and return
+    return {
+        "active_profile": format_profile_for_prompt(active_profile),
+        "compressed_history": compressed["summary"] if compressed else "First session with this pet.",
+        "gap_list": gap_list,
+        "current_session": session_msgs,
+        "user_message": user_message,
+        "life_stage": pet["life_stage"]
+    }
+```
+
+**Staleness check uses life stage modifiers:**
+
+```python
+DECAY_MULTIPLIERS = {
+    "puppy": 1.5,    # 0-6 months — info goes stale 50% faster
+    "junior": 1.0,   # 6 months - 2 years — baseline
+    "adult": 0.75,   # 2-7 years — info stays valid 25% longer
+    "senior": 1.0,   # 7+ years — back to baseline
+}
+
+def is_stale(updated_at: datetime, life_stage: str) -> bool:
+    age_days = (now() - updated_at).days
+    multiplier = DECAY_MULTIPLIERS.get(life_stage, 1.0)
+    effective_age = age_days * multiplier
+    return effective_age > 30  # Stale if effectively older than 30 days
+```
+
 ---
 
 ## 5. Data Architecture
@@ -419,6 +591,27 @@ The system uses **two layers** to balance auditability with performance:
 - **Trend analysis:** "Luna's appetite has been declining over 3 months" — requires historical rows.
 - **Conversation compaction:** When summarizing old conversations, we have the full log. If compaction fails, nothing is lost.
 - **Debugging:** Every fact has a `source_quote` and timestamp. We can trace exactly where any piece of information came from.
+
+**Enforcing append-only at the database level:**
+
+```sql
+-- Revoke UPDATE and DELETE on fact_log from the application role
+REVOKE UPDATE, DELETE ON fact_log FROM app_user;
+
+-- Or use a trigger as a safety net
+CREATE OR REPLACE FUNCTION prevent_fact_log_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'fact_log is append-only. UPDATE and DELETE are not allowed.';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER no_update_fact_log
+    BEFORE UPDATE OR DELETE ON fact_log
+    FOR EACH ROW EXECUTE FUNCTION prevent_fact_log_mutation();
+```
+
+At the application layer, the `fact_log` repository exposes only an `insert()` method — no `update()` or `delete()`.
 
 ### 5.3 Why active_profile Doesn't Grow Unboundedly
 
@@ -655,7 +848,7 @@ GET /api/v1/pet/{pet_id}/context
 Response (200):
 {
   "pet_id": "uuid",
-  "summary": "Luna is a 2-year-old Shiba Inu who eats raw food twice daily...",
+  "profile_summary": "CURRENT STATE:\nLuna is a 2-year-old female Shiba Inu...\n\nHEALTH HISTORY:\nMar 2024: Ear infection...\n\nGAPS: Exercise level unknown.",
   "confidence_score": 72,
   "last_updated": "2024-03-20T14:30:00Z",
   "life_stage": "adult",
@@ -665,32 +858,84 @@ Response (200):
 
 ### 8.3 Redis Caching Strategy
 
-| Property | Value |
-|---|---|
-| **Key format** | `pet:{pet_id}:summary` |
-| **Value** | NL summary string (~900 tokens) |
-| **TTL** | 24 hours (86400 seconds) |
-| **Target latency** | < 100ms (Redis typically responds in < 5ms) |
-| **Invalidation** | Re-written after every Aggregator update + after nightly batch |
-| **Cache miss** | Generate summary on-the-fly from active_profile, cache it, return |
+The system caches **two things** in Redis per pet:
 
-### 8.4 When the Redis Summary is Generated
+| Redis Key | What | Built From | Updated | TTL | Used By |
+|---|---|---|---|---|---|
+| `pet:{id}:active_profile` | Raw JSON of current key-values | `active_profile` table | After every Aggregator UPSERT | 1 hour | Agent 1 (context loading, every turn) |
+| `pet:{id}:profile_summary` | Single NL summary (current state + health history) | `active_profile` + `fact_log` | See update strategy below | 24 hours | Health/Food modules via REST API |
 
-| Trigger | When | Why |
-|---|---|---|
-| After every conversation | Real-time | User just provided new info, summary should reflect it immediately |
-| After nightly batch job | 3:00 AM | Passive extraction may have added new facts from Health/Food logs |
-| On cache miss (fallback) | On demand | TTL expired or first ever request for this pet |
+**Target latency:** < 100ms for all Redis reads (Redis typically responds in < 5ms).
 
-### 8.5 NL Summary Example
+### 8.4 Profile Summary — Update Strategy
+
+The profile summary has two sections: **current state** (cheap to rebuild) and **historical context** (expensive to rebuild). They update at different frequencies but are stored as ONE string.
 
 ```
-"Luna is a 2-year-old Shiba Inu living with one owner who works from home.
-She eats raw food twice daily and has moderate energy levels. She was recently
-prescribed antibiotics by her vet (as of 3 days ago). No known chronic
-conditions. Owner tends to be anxious about health changes. Luna's personality
-is playful and she loves squeaky toys. Exercise level and recent weight are unknown."
+Profile Summary = [Current State Section] + [Historical Section]
 ```
+
+| Section | How it's built | When it's rebuilt | Cost |
+|---|---|---|---|
+| **Current state** | Template from `active_profile` (15-30 rows) | After every Aggregator UPSERT | ~1-5ms, zero LLM cost |
+| **Historical context** | LLM summarizes `fact_log` health entries (last 50 rows) | Nightly batch only | ~500ms, ~$0.001 LLM cost |
+
+```python
+# After every Aggregator UPSERT:
+async def update_profile_summary(pet_id: str):
+    # Rebuild current state section from active_profile (cheap, template-based)
+    profile = await db.query("SELECT * FROM active_profile WHERE pet_id = $1", pet_id)
+    current_section = template_current_state(profile)
+
+    # Reuse cached historical section (don't regenerate — that's nightly only)
+    cached_history = await redis.get(f"pet:{pet_id}:history_section")
+    if not cached_history:
+        cached_history = "Health history not yet generated."
+
+    # Combine into one summary
+    full_summary = f"{current_section}\n\n{cached_history}"
+    await redis.set(f"pet:{pet_id}:profile_summary", full_summary, ex=86400)
+
+# Nightly batch job:
+async def regenerate_history_section(pet_id: str):
+    # Read health-related fact_log entries (expensive, LLM-based)
+    health_facts = await db.query(
+        """SELECT key, value, confidence, created_at FROM fact_log
+           WHERE pet_id = $1 AND key IN ('medications','chronic_conditions',
+           'recent_symptoms','vet_visits','appetite','energy_level','weight_change')
+           ORDER BY created_at DESC LIMIT 50""",
+        pet_id
+    )
+    history_section = await llm_summarize_health_history(health_facts)
+    await redis.set(f"pet:{pet_id}:history_section", history_section, ex=172800)  # 48h TTL
+
+    # Also rebuild the full profile summary with the new history
+    await update_profile_summary(pet_id)
+```
+
+**Why this is simple:** No patching, no severity maps, no complex logic. Current state is always rebuilt from template (~1ms). Historical section is cached and only regenerated nightly. Both combine into one summary string.
+
+### 8.5 Profile Summary Example
+
+The single combined summary that Health/Food modules receive:
+
+```
+"CURRENT STATE:
+Luna is a 2-year-old female Shiba Inu (adult stage). Eats raw food twice
+daily. Energy is currently low/tired (as of today). On antibiotics for
+ear infection (started March 15). Appetite is normal. No known chronic
+conditions. Personality is playful, loves squeaky toys.
+
+HEALTH HISTORY:
+Mar 2024: Ear infection diagnosed, started antibiotics. Appetite decreased
+during this period, recovered by April. Jan 2024: Low energy episode
+lasting ~1 week, resolved without intervention. Weight stable at 8-8.2kg
+for past 6 months. No recurring patterns of concern.
+
+GAPS: Exercise level and recent weight change are unknown."
+```
+
+This gives the Health module everything a doctor would need: who the patient is NOW + what happened BEFORE — in one artifact.
 
 ---
 
@@ -848,19 +1093,72 @@ This preserves the **emotional context** and **relationship dynamics** — not t
 
 ## 12. Quality Assurance & Filters
 
-### 12.1 Post-Processing Filter (Guardrail Layer)
+The system uses a **three-layer defense-in-depth** approach to ensure the agent never provides medical advice and always stays in character.
 
-Every response from Agent 1 passes through automated filters BEFORE reaching the user:
+### 12.1 Layer 1 — Pre-Processing Intent Classifier (BEFORE Agent 1)
 
-| Filter | What it catches | Action |
+A fast keyword-based classifier runs on the user's message BEFORE it reaches Agent 1. This catches obvious medical/nutritional queries early.
+
+```python
+MEDICAL_KEYWORDS = [
+    "vomit", "bleed", "lump", "limp", "diarrhea", "seizure",
+    "not eating", "swollen", "breathing", "pain", "sick",
+    "emergency", "poison", "injured", "fever"
+]
+NUTRITION_KEYWORDS = [
+    "what to feed", "is .+ safe", "diet change", "food recommendation",
+    "how much to feed", "supplements", "calories", "nutrition"
+]
+
+def classify_intent(message: str) -> str:
+    lower = message.lower()
+    if any(kw in lower for kw in MEDICAL_KEYWORDS):
+        return "medical"
+    if any(re.search(kw, lower) for kw in NUTRITION_KEYWORDS):
+        return "nutritional"
+    return "general"
+```
+
+If intent is `medical` or `nutritional`, Agent 1 receives an `intent_flag` in its input so it knows to ONLY give empathy + set redirect.
+
+### 12.2 Layer 2 — Prompt Instructions (INSIDE Agent 1)
+
+The system prompt explicitly forbids medical advice (see Agent 1 prompt template in Section 4.1). The LLM is instructed to return `intent_flag: "medical"` in its response JSON when it detects health concerns, even if the pre-processing classifier missed it.
+
+### 12.3 Layer 3 — Post-Processing Regex Filter (AFTER Agent 1)
+
+Every response passes through automated regex checks BEFORE reaching the user. This is the last line of defense.
+
+```python
+FORBIDDEN_PATTERNS = [
+    (r"\b(diagnos|treatment|prescri|prognosis|dosage)\b", "medical_jargon"),
+    (r"\b(you should (give|take|try|use))\b", "directive_advice"),
+    (r"\b(I recommend|I suggest you)\b", "directive_advice"),
+    (r"\b(it could be|it might be|sounds like .+ disease)\b", "pseudo_diagnosis"),
+    (r"\b(I understand your concern|As an AI)\b", "robotic_pattern"),
+    (r"\b(You should|You need to|It's important that)\b", "preachy_tone"),
+]
+
+def filter_response(response: str) -> tuple[bool, list[str]]:
+    violations = []
+    for pattern, category in FORBIDDEN_PATTERNS:
+        if re.search(pattern, response, re.IGNORECASE):
+            violations.append(category)
+    return (len(violations) == 0, violations)
+
+# If violations found → regenerate with stricter prompt OR fallback to template response
+```
+
+| Filter | What it catches | Action on violation |
 |---|---|---|
-| **Medical jargon** | Words like "diagnosis", "treatment", "prescription", "prognosis" | Replace with softer language or trigger redirect |
-| **Robotic patterns** | "I understand your concern", "As an AI assistant" | Rephrase or regenerate |
-| **Preachy tone** | "You should...", "You need to...", "It's important that..." | Soften to suggestions: "Maybe we could try~" |
-| **Consecutive questions** | More than 3 questions in one response | Trim to max 1-2 questions |
-| **Medical intent missed** | Agent 1 accidentally started giving health advice | Block response, trigger redirect to Health module |
+| **Medical jargon** | "diagnosis", "treatment", "prescription" | Regenerate response with stricter prompt |
+| **Pseudo-diagnosis** | "it sounds like", "it could be [disease]" | Block and redirect to Health module |
+| **Directive advice** | "you should give", "I recommend" | Soften to suggestion: "Maybe we could try~" |
+| **Robotic patterns** | "I understand your concern", "As an AI" | Regenerate response |
+| **Preachy tone** | "You should...", "You need to..." | Soften language |
+| **Question overload** | More than 3 questions in one response | Trim to max 1-2 questions |
 
-### 12.2 Human Review Protocol
+### 12.4 Human Review Protocol
 
 | Phase | Review Rate | Purpose |
 |---|---|---|
@@ -924,16 +1222,42 @@ Step 5: Ongoing (Confidence Bar: 🟢 maintenance)
 
 ---
 
-## Appendix: Technology Stack Summary
+## Appendix A: Technology Stack
+
+### Core Infrastructure
+
+| Layer | Technology | Rationale |
+|---|---|---|
+| **Backend API** | Python (FastAPI) | Async-first for non-blocking LLM calls, strong typing with Pydantic |
+| **Primary Database** | PostgreSQL 16+ | UPSERT support, JSONB columns, robust indexing, battle-tested |
+| **Cache** | Redis 7+ | In-memory key-value, < 5ms reads, TTL, pub/sub for invalidation |
+| **Task Queue** | Redis Streams or BullMQ | Async processing for Compressor + Aggregator pipeline |
+| **Scheduler** | APScheduler (Python) or Cloud Scheduler | Nightly batch jobs, confidence decay cron |
+
+### AI / LLM Layer
+
+| Component | Technology | Cost (approx.) | Latency |
+|---|---|---|---|
+| Agent 1 (Conversation) | GPT-4o / Claude 3.5 Sonnet | ~$0.005/turn | ~1-2s |
+| Agent 2 (Compressor) | GPT-4o-mini / Claude Haiku | ~$0.0001/turn | ~200-500ms |
+| Agent 3 (Aggregator) | Application code (no LLM) | $0 | ~5ms |
+| Regex entity gate | Python `re` module | $0 | ~1ms |
+| History section generation | GPT-4o-mini / Haiku (nightly) | ~$0.001/pet/day | ~500ms |
+| Conversation compaction | GPT-4o-mini / Haiku | ~$0.001/compaction | ~500ms |
+
+### Guardrails & Quality
 
 | Component | Technology | Rationale |
 |---|---|---|
-| Conversation Agent (Agent 1) | GPT-4o / Claude 3.5 Sonnet | Best emotional intelligence and nuance |
-| Compressor (Agent 2) | GPT-4o-mini / Claude Haiku | Fast + cheap structured extraction |
-| Aggregator (Agent 3) | Application code (no LLM) | Deterministic logic — doesn't need AI |
-| Primary Database | PostgreSQL | Reliable, supports UPSERT, JSONB, indexing |
-| Cache | Redis | In-memory, < 5ms reads, TTL support |
-| NL Summary Generation | Template-based (v1) → LLM (v2) | Start simple, upgrade when needed |
-| Post-Processing Filters | Rule-based + regex | Fast, predictable, no LLM cost |
-| Nightly Batch | Cron job (or cloud scheduler) | Simple, reliable, runs during off-peak |
-| API | REST (JSON) | Standard, well-understood by all modules |
+| Intent classifier (Layer 1) | Keyword regex (Python) | Zero cost, instant, catches obvious cases |
+| Prompt guardrails (Layer 2) | System prompt instructions | Part of LLM call, no extra cost |
+| Response filter (Layer 3) | Regex patterns (Python) | Fast, predictable, no LLM cost |
+| LLM observability | Langfuse or LangSmith | Track cost, latency, quality per agent |
+
+### Summary Generation
+
+| Component | Technology | Rationale |
+|---|---|---|
+| Current state section | Template-based (Python f-strings) | ~1ms, zero LLM cost, rebuilt every update |
+| History section | LLM summarization (nightly) | Needs narrative generation from raw facts |
+| Profile summary | Combination of above two | One artifact for external modules |

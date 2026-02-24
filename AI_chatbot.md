@@ -1,52 +1,115 @@
 # Pet Health Companion — System Design Document
 
-> **Version:** 1.1
-> **Date:** 2026-02-24
-> **Status:** Draft
+## Introduction
+
+In this document, I’ve shared how I approach this problem and honestly, how I approach any technical problem. It outlines the exact thinking process and framework I use before I start building anything.
+
+This is very close to the kind of document I would write for myself and my team before moving into prototyping. I try to first understand the problem deeply, break it into components, think through edge cases, risks, system interactions, and guardrails or evaluation  , and only then move toward implementation.
+
+I prepared this in one focused night and did my best to think through as many aspects as possible within that time. The goal was not to present a final system, but to clearly show my reasoning, structure, and decision-making process.
+
+I hope this gives you a clear picture of how I think and how I would approach building a system like this.
 
 ---
 
 ## Table of Contents
 
-1. [System Overview](#1-system-overview)
-2. [System Architecture Diagram](#2-system-architecture-diagram)
-3. [Data Flow Diagram (Sequence)](#3-data-flow-diagram-sequence)
-4. [Core Agents — The Three-Agent Pipeline](#4-core-agents--the-three-agent-pipeline)
-   - 4.4 [Context Building Strategy](#44-context-building-strategy)
-5. [Data Architecture](#5-data-architecture)
-6. [Confidence Bar — Calculation Logic](#6-confidence-bar--calculation-logic)
-7. [Information Priority Schema](#7-information-priority-schema)
-8. [Integration with Specialized Modules](#8-integration-with-specialized-modules)
-9. [Redirection Logic — Guardrails & Deep Links](#9-redirection-logic--guardrails--deep-links)
-10. [Passive Context Gathering](#10-passive-context-gathering)
-11. [Conversation Context Management](#11-conversation-context-management)
-12. [Quality Assurance & Filters (Three-Layer Defense)](#12-quality-assurance--filters)
-13. [User Onboarding Flow](#13-user-onboarding-flow)
-14. [Future Roadmap](#14-future-roadmap)
-15. [Appendix A: Technology Stack](#appendix-a-technology-stack)
+1. [My Approach](#1-my-approach)
+2. [Delivery Plan](#2-delivery-plan)
+3. [System Architecture Diagram](#3-system-architecture-diagram)
+4. [Data Flow Diagram (Sequence)](#4-data-flow-diagram-sequence)
+5. [Core Agents — The Three-Agent Pipeline](#5-core-agents--the-three-agent-pipeline)
+   - 5.4 [Context Building Strategy](#54-context-building-strategy)
+6. [Data Architecture](#6-data-architecture)
+7. [Confidence Bar — Calculation Logic](#7-confidence-bar--calculation-logic)
+8. [Information Priority Schema](#8-information-priority-schema)
+9. [Integration with Specialized Modules](#9-integration-with-specialized-modules)
+10. [Redirection Logic — Guardrails & Deep Links](#10-redirection-logic--guardrails--deep-links)
+11. [Passive Context Gathering](#11-passive-context-gathering)
+12. [Conversation Context Management](#12-conversation-context-management)
+13. [Quality Assurance & Filters (Three-Layer Defense)](#13-quality-assurance--filters)
+14. [User Onboarding Flow](#14-user-onboarding-flow)
+15. [Future Roadmap](#15-future-roadmap)
 
 ---
 
-## 1. System Overview
+## 1. My Approach
 
-This system is a **multi-agent AI companion** designed for pet parents. It is NOT a diagnostic tool, teacher, or data-entry form. Its purpose is to build a long-term relationship with the user by conversationally gathering and maintaining a rich pet profile over time.
+### How I Think About Building
 
-**Core Value Proposition:** *"You understand without me having to say everything."*
+For every technical problem, my process follows the same discipline:
 
-### Key Characteristics
+**Understand first, build second.** Before I write a single line of code, I need the full picture — the product vision, the users, every building block, and how they fit together. I break the problem into components, identify the unknowns, and document my understanding. This document itself is that process in action.
 
-| Aspect | Description |
-|---|---|
-| **Architecture** | Three-agent pipeline (Conversation → Compressor → Aggregator) |
-| **Data Strategy** | Append-only fact log + computed active profile |
-| **Integration** | Serves context to Health & Food modules via REST + Redis |
-| **Guardrails** | Never answers medical/nutritional questions directly; redirects to specialized modules |
-| **Tone** | Warm, friendly, non-judgmental. No medical jargon. No robotic patterns. |
-| **Engagement** | Confidence Bar (green/yellow/red) motivates users to keep information current |
+### The Process
+
+```
+Step 1: Understand the Problem
+├── Read the PRD. Not skim — read.
+├── Identify every feature, constraint, and user expectation
+├── Break down the system into components
+├── Map how components interact with each other
+└── Ask questions about anything unclear BEFORE designing
+
+Step 2: Document the Design
+├── Write a system design document (this document)
+├── Draw architecture diagrams and data flows
+├── Define data models, API contracts, and prompt templates
+├── Think through edge cases and trade-offs ON PAPER
+└── Get alignment from the team before coding
+
+Step 3: Build a Prototype (Internal Review)
+├── Build the riskiest/hardest component first
+├── Get it working end-to-end, even if rough
+├── Internal team reviews: does the approach work?
+├── Catch fundamental design mistakes early
+└── Prototype is throwaway — it's for learning, not shipping
+
+Step 4: Build the MVP (User Testing)
+├── Rebuild with production patterns informed by prototype learnings
+├── Ship the minimum slice that delivers the core value prop
+├── Test with real users — does it actually feel like
+│   "You understand without me having to say everything"?
+└── Collect feedback and measure quality (see Evaluation Strategy)
+
+Step 5: Iterate to Maturity
+├── Each iteration adds one capability layer
+├── Update this document as assumptions get validated or invalidated
+├── Keep the document as living history — don't delete old decisions,
+│   annotate why they changed
+└── Gradually move from MVP to production quality
+```
+
+### Why This Approach Works for THIS Problem
+
+This system is a **multi-agent AI product**. Multi-agent systems have a specific challenge: you can't predict how LLMs will behave until you run them. The Compressor might hallucinate facts. The Conversation Agent might accidentally give medical advice. The Aggregator's conflict resolution logic might not match real-world patterns.
+
+**You can't design this perfectly upfront.** You MUST prototype, test, measure, and iterate. But you also can't just start coding blindly — without understanding the full system, you'll build components that don't fit together.
+
+This approach balances both: **think deeply upfront, then validate quickly through iteration.**
 
 ---
 
-## 2. System Architecture Diagram
+## 2. Delivery Plan
+
+```
+PROTOTYPE (Weeks 1-3)                    MVP (Weeks 4-8)
+Internal review only                     Real users testing
+─────────────────────                    ────────────────────
+Goal: Prove the 3-agent                 Goal: Deliver core value
+pipeline works end-to-end               "You understand without
+                                        me having to say everything"
+
+                    ITERATE (Weeks 9+)
+                    Feature-by-feature
+                    ─────────────────────
+                    Goal: Add modules,
+                    polish, scale
+```
+
+---
+
+## 3. System Architecture Diagram
 
 ```mermaid
 graph TB
@@ -123,9 +186,9 @@ graph TB
 
 ---
 
-## 3. Data Flow Diagram (Sequence)
+## 4. Data Flow Diagram (Sequence)
 
-### 3.1 Primary Conversation Flow
+### 4.1 Primary Conversation Flow
 
 This sequence diagram shows the complete data flow when a user sends a message and receives a response.
 
@@ -184,7 +247,7 @@ sequenceDiagram
     API --) User: Update Confidence Bar UI → Yellow 🟡
 ```
 
-### 3.2 Medical Query — Redirection Flow
+### 4.2 Medical Query — Redirection Flow
 
 This diagram shows what happens when the user asks a medical question that triggers the guardrail redirect.
 
@@ -219,7 +282,7 @@ sequenceDiagram
     Health -->> User: Medical guidance (from Health Module, not main chatbot)
 ```
 
-### 3.3 External Module — Context Retrieval Flow
+### 4.3 External Module — Context Retrieval Flow
 
 Shows how Health/Food modules fetch pet context, including the Redis cache-miss fallback.
 
@@ -248,7 +311,7 @@ sequenceDiagram
     end
 ```
 
-### 3.4 Nightly Batch — Passive Context Gathering
+### 4.4 Nightly Batch — Passive Context Gathering
 
 Shows how the system learns from other modules' conversations without the user explicitly telling it.
 
@@ -290,17 +353,17 @@ sequenceDiagram
 
 ---
 
-## 4. Core Agents — The Three-Agent Pipeline
+## 5. Core Agents — The Three-Agent Pipeline
 
-### 4.1 Agent 1: Conversation Agent
+### 5.1 Agent 1: Conversation Agent
 
-| Property | Detail |
-|---|---|
+| Property           | Detail                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------- |
 | **Responsibility** | Generate empathetic, on-brand responses. This is the ONLY agent the user directly interacts with. |
-| **Model** | GPT-4o or Claude 3.5 Sonnet (high emotional intelligence, nuance in Japanese) |
-| **Inputs** | `user_message`, `active_profile`, `compressed_history`, `gap_list`, `life_stage` |
-| **Output** | Natural language response (passed through guardrail filter before reaching user) |
-| **Key Constraint** | Ask only 1–3 questions per session. Never force consecutive questions. |
+| **Model**          | GPT-4o or Claude 3.5 Sonnet (high emotional intelligence, nuance in Japanese)                     |
+| **Inputs**         | `user_message`, `active_profile`, `compressed_history`, `gap_list`, `life_stage`                  |
+| **Output**         | Natural language response (passed through guardrail filter before reaching user)                  |
+| **Key Constraint** | Ask only 1–3 questions per session. Never force consecutive questions.                            |
 
 **Prompt Template:**
 
@@ -358,14 +421,14 @@ System Prompt:
 Total context: ~800-1500 tokens — well within limits
 ```
 
-### 4.2 Agent 2: Compressor
+### 5.2 Agent 2: Compressor
 
-| Property | Detail |
-|---|---|
-| **Responsibility** | Convert natural language into structured JSON facts |
-| **Model** | GPT-4o-mini or Claude Haiku (fast, cheap — this is a structured extraction task) |
-| **Input** | Raw user message text |
-| **Output** | Array of `{key, value, confidence, source_quote}` |
+| Property           | Detail                                                                           |
+| ------------------ | -------------------------------------------------------------------------------- |
+| **Responsibility** | Convert natural language into structured JSON facts                              |
+| **Model**          | GPT-4o-mini or Claude Haiku (fast, cheap — this is a structured extraction task) |
+| **Input**          | Raw user message text                                                            |
+| **Output**         | Array of `{key, value, confidence, source_quote}`                                |
 
 #### Regex Pre-filter (Skip unnecessary LLM calls)
 
@@ -441,13 +504,13 @@ USER: {{user_message}}
   {
     "key": "appetite",
     "value": "decreased — barely ate",
-    "confidence": 0.80,
+    "confidence": 0.8,
     "source_quote": "barely touched her kibble this morning"
   },
   {
     "key": "diet_type",
     "value": "kibble",
-    "confidence": 0.60,
+    "confidence": 0.6,
     "source_quote": "her kibble"
   }
 ]
@@ -455,14 +518,14 @@ USER: {{user_message}}
 
 Note: `diet_type: kibble` has low confidence (0.60) because the user didn't explicitly say "she eats kibble" — she might eat multiple things and kibble was just mentioned.
 
-### 4.3 Agent 3: Aggregator
+### 5.3 Agent 3: Aggregator
 
-| Property | Detail |
-|---|---|
-| **Responsibility** | Merge new facts with existing profile, resolve conflicts, identify gaps |
-| **Model** | No LLM needed — this is deterministic logic (code, not AI) |
-| **Input** | Extracted facts from Agent 2 + current active_profile rows |
-| **Output** | Updated active_profile, updated gap_list, trigger for confidence recalculation |
+| Property           | Detail                                                                         |
+| ------------------ | ------------------------------------------------------------------------------ |
+| **Responsibility** | Merge new facts with existing profile, resolve conflicts, identify gaps        |
+| **Model**          | No LLM needed — this is deterministic logic (code, not AI)                     |
+| **Input**          | Extracted facts from Agent 2 + current active_profile rows                     |
+| **Output**         | Updated active_profile, updated gap_list, trigger for confidence recalculation |
 
 **Conflict resolution rules (in priority order):**
 
@@ -497,7 +560,7 @@ function aggregate(newFact, currentEntry):
     // The new fact is still in fact_log for audit
 ```
 
-### 4.4 Context Building Strategy
+### 5.4 Context Building Strategy
 
 This is the logic that assembles everything Agent 1 needs before each response. It runs on every user message.
 
@@ -574,18 +637,18 @@ def is_stale(updated_at: datetime, life_stage: str) -> bool:
 
 ---
 
-## 5. Data Architecture
+## 6. Data Architecture
 
-### 5.1 Two-Layer Storage Design
+### 6.1 Two-Layer Storage Design
 
 The system uses **two layers** to balance auditability with performance:
 
-| Layer | Purpose | Write Pattern | Read Pattern |
-|---|---|---|---|
+| Layer                                    | Purpose                                                                                                       | Write Pattern                        | Read Pattern                                                       |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------------------------ |
 | **fact_log** (JSONL / append-only table) | Full history of every fact ever extracted. Used for audit, rollback, trend analysis, conversation compaction. | APPEND only — never update or delete | Rarely read in real-time. Used by nightly jobs and trend analysis. |
-| **active_profile** (computed view table) | Current best-known value for each unique key per pet. This is what agents actually use. | UPSERT — one row per (pet_id, key) | Read every conversation turn. Fast indexed lookups. |
+| **active_profile** (computed view table) | Current best-known value for each unique key per pet. This is what agents actually use.                       | UPSERT — one row per (pet_id, key)   | Read every conversation turn. Fast indexed lookups.                |
 
-### 5.2 Why Append-Only?
+### 6.2 Why Append-Only?
 
 - **Rollback safety:** If Agent 2 hallucinates a fact, the old correct value still exists in the log. We revert the active_profile entry and point it at the previous log row.
 - **Trend analysis:** "Luna's appetite has been declining over 3 months" — requires historical rows.
@@ -613,11 +676,11 @@ CREATE TRIGGER no_update_fact_log
 
 At the application layer, the `fact_log` repository exposes only an `insert()` method — no `update()` or `delete()`.
 
-### 5.3 Why active_profile Doesn't Grow Unboundedly
+### 6.3 Why active_profile Doesn't Grow Unboundedly
 
 The active_profile has a `PRIMARY KEY (pet_id, key)`. The number of rows per pet = number of unique keys you define (typically 15-30). It never grows beyond that. The fact_log grows over time but is never read in real-time conversation flows.
 
-### 5.4 PostgreSQL Schema
+### 6.4 PostgreSQL Schema
 
 ```sql
 -- ============================================
@@ -707,7 +770,7 @@ CREATE INDEX idx_compressed_pet
     ON compressed_history(pet_id, created_at DESC);
 ```
 
-### 5.5 Aggregator UPSERT Example
+### 6.5 Aggregator UPSERT Example
 
 ```sql
 -- The Aggregator runs this after deciding the new fact wins:
@@ -724,53 +787,53 @@ DO UPDATE SET
 
 ---
 
-## 6. Confidence Bar — Calculation Logic
+## 7. Confidence Bar — Calculation Logic
 
-### 6.1 Formula
+### 7.1 Formula
 
 ```
 Confidence Score = (Coverage × 0.4) + (Recency × 0.3) + (Depth × 0.3)
 ```
 
-### 6.2 Component Breakdown
+### 7.2 Component Breakdown
 
-| Component | Weight | What it measures | How it's calculated |
-|---|---|---|---|
-| **Coverage** | 40% | How many priority items (Rank A/B/C) have been answered | `answered_items / total_priority_items` |
-| **Recency** | 30% | How fresh is the data | Weighted average of individual item freshness scores |
-| **Depth** | 30% | How detailed are the answers | Based on word count + semantic richness of stored values |
+| Component    | Weight | What it measures                                        | How it's calculated                                      |
+| ------------ | ------ | ------------------------------------------------------- | -------------------------------------------------------- |
+| **Coverage** | 40%    | How many priority items (Rank A/B/C) have been answered | `answered_items / total_priority_items`                  |
+| **Recency**  | 30%    | How fresh is the data                                   | Weighted average of individual item freshness scores     |
+| **Depth**    | 30%    | How detailed are the answers                            | Based on word count + semantic richness of stored values |
 
-### 6.3 Recency Decay Table
+### 7.3 Recency Decay Table
 
-| Data Age | Recency Score |
-|---|---|
-| 0–7 days | 1.0 |
-| 8–14 days | 0.9 |
-| 15–30 days | 0.7 |
-| 31–60 days | 0.5 |
-| 61–90 days | 0.4 |
-| 91+ days | 0.3 |
+| Data Age   | Recency Score |
+| ---------- | ------------- |
+| 0–7 days   | 1.0           |
+| 8–14 days  | 0.9           |
+| 15–30 days | 0.7           |
+| 31–60 days | 0.5           |
+| 61–90 days | 0.4           |
+| 91+ days   | 0.3           |
 
-### 6.4 Life Stage Modifiers
+### 7.4 Life Stage Modifiers
 
 The decay rate is adjusted based on how fast the pet's biology changes:
 
-| Life Stage | Decay Modifier | Rationale |
-|---|---|---|
-| Puppy/Kitten (0–6 months) | 1.5× faster decay | Rapid growth — info becomes stale quickly |
-| Junior (6 months – 2 years) | 1.0× (baseline) | Standard rate |
-| Adult (2–7 years) | 0.75× slower decay | Stable period — info stays valid longer |
-| Senior (7+ years) | 1.0× (baseline) | Health can shift, back to standard monitoring |
+| Life Stage                  | Decay Modifier     | Rationale                                     |
+| --------------------------- | ------------------ | --------------------------------------------- |
+| Puppy/Kitten (0–6 months)   | 1.5× faster decay  | Rapid growth — info becomes stale quickly     |
+| Junior (6 months – 2 years) | 1.0× (baseline)    | Standard rate                                 |
+| Adult (2–7 years)           | 0.75× slower decay | Stable period — info stays valid longer       |
+| Senior (7+ years)           | 1.0× (baseline)    | Health can shift, back to standard monitoring |
 
-### 6.5 Status Indicators
+### 7.5 Status Indicators
 
-| Score Range | Color | Meaning |
-|---|---|---|
-| 80–100% | 🟢 Green | System is well-informed with recent, detailed data |
-| 50–79% | 🟡 Yellow | Information is missing or becoming outdated |
-| 0–49% | 🔴 Red | Significant information gaps exist |
+| Score Range | Color     | Meaning                                            |
+| ----------- | --------- | -------------------------------------------------- |
+| 80–100%     | 🟢 Green  | System is well-informed with recent, detailed data |
+| 50–79%      | 🟡 Yellow | Information is missing or becoming outdated        |
+| 0–49%       | 🔴 Red    | Significant information gaps exist                 |
 
-### 6.6 When Confidence is Recalculated
+### 7.6 When Confidence is Recalculated
 
 - After every Aggregator update (real-time, per conversation)
 - After nightly batch job completes (passive extraction may fill gaps)
@@ -778,7 +841,7 @@ The decay rate is adjusted based on how fast the pet's biology changes:
 
 ---
 
-## 7. Information Priority Schema
+## 8. Information Priority Schema
 
 Data collection is prioritized by clinical and lifestyle relevance. The Aggregator uses this to determine which gaps to fill first.
 
@@ -786,44 +849,44 @@ Data collection is prioritized by clinical and lifestyle relevance. The Aggregat
 
 These are asked first during onboarding conversations.
 
-| Key | Example Value |
-|---|---|
-| `chronic_illness` | "None" / "Hip dysplasia" |
-| `medications` | "Antibiotics (since 2024-03-18)" |
-| `diet_type` | "Raw food" / "Kibble" / "Home-cooked" |
-| `feeding_frequency` | "Twice daily" |
-| `toilet_timing` | "Regular, 3x daily" |
+| Key                 | Example Value                         |
+| ------------------- | ------------------------------------- |
+| `chronic_illness`   | "None" / "Hip dysplasia"              |
+| `medications`       | "Antibiotics (since 2024-03-18)"      |
+| `diet_type`         | "Raw food" / "Kibble" / "Home-cooked" |
+| `feeding_frequency` | "Twice daily"                         |
+| `toilet_timing`     | "Regular, 3x daily"                   |
 
 ### Rank B — Life Context
 
-| Key | Example Value |
-|---|---|
-| `home_alone_frequency` | "8 hours on weekdays" |
-| `exercise_level` | "30 min walk daily" |
+| Key                    | Example Value           |
+| ---------------------- | ----------------------- |
+| `home_alone_frequency` | "8 hours on weekdays"   |
+| `exercise_level`       | "30 min walk daily"     |
 | `recent_weight_change` | "Lost 0.5kg last month" |
 
 ### Rank C — Resolution (Detail)
 
-| Key | Example Value |
-|---|---|
-| `personality` | "Shy with strangers, playful at home" |
-| `favorite_toys` | "Squeaky ball, rope toy" |
-| `grooming_frequency` | "Monthly professional grooming" |
+| Key                  | Example Value                         |
+| -------------------- | ------------------------------------- |
+| `personality`        | "Shy with strangers, playful at home" |
+| `favorite_toys`      | "Squeaky ball, rope toy"              |
+| `grooming_frequency` | "Monthly professional grooming"       |
 
 ### Rank E — Emotional (Relationship Building)
 
-| Key | Example Value |
-|---|---|
-| `happiest_moment` | "When we go to the beach" |
-| `unforgettable_memory` | "The day we adopted her" |
+| Key                    | Example Value             |
+| ---------------------- | ------------------------- |
+| `happiest_moment`      | "When we go to the beach" |
+| `unforgettable_memory` | "The day we adopted her"  |
 
 **Gap prioritization:** When the Aggregator computes the gap_list for the next session, it sorts by: Rank A first → Rank B → Rank C. Rank E items are asked opportunistically when the conversation flows naturally.
 
 ---
 
-## 8. Integration with Specialized Modules
+## 9. Integration with Specialized Modules
 
-### 8.1 Architecture
+### 9.1 Architecture
 
 The main chatbot system serves as a **context provider** for Health and Food modules. These modules are separate AI systems that handle domain-specific queries.
 
@@ -840,7 +903,7 @@ Main Chatbot System                    Health Module / Food Module
 └──────────────────┘                  └──────────────────────────┘
 ```
 
-### 8.2 REST API Endpoint
+### 9.2 REST API Endpoint
 
 ```
 GET /api/v1/pet/{pet_id}/context
@@ -856,18 +919,18 @@ Response (200):
 }
 ```
 
-### 8.3 Redis Caching Strategy
+### 9.3 Redis Caching Strategy
 
 The system caches **two things** in Redis per pet:
 
-| Redis Key | What | Built From | Updated | TTL | Used By |
-|---|---|---|---|---|---|
-| `pet:{id}:active_profile` | Raw JSON of current key-values | `active_profile` table | After every Aggregator UPSERT | 1 hour | Agent 1 (context loading, every turn) |
-| `pet:{id}:profile_summary` | Single NL summary (current state + health history) | `active_profile` + `fact_log` | See update strategy below | 24 hours | Health/Food modules via REST API |
+| Redis Key                  | What                                               | Built From                    | Updated                       | TTL      | Used By                               |
+| -------------------------- | -------------------------------------------------- | ----------------------------- | ----------------------------- | -------- | ------------------------------------- |
+| `pet:{id}:active_profile`  | Raw JSON of current key-values                     | `active_profile` table        | After every Aggregator UPSERT | 1 hour   | Agent 1 (context loading, every turn) |
+| `pet:{id}:profile_summary` | Single NL summary (current state + health history) | `active_profile` + `fact_log` | See update strategy below     | 24 hours | Health/Food modules via REST API      |
 
 **Target latency:** < 100ms for all Redis reads (Redis typically responds in < 5ms).
 
-### 8.4 Profile Summary — Update Strategy
+### 9.4 Profile Summary — Update Strategy
 
 The profile summary has two sections: **current state** (cheap to rebuild) and **historical context** (expensive to rebuild). They update at different frequencies but are stored as ONE string.
 
@@ -875,10 +938,10 @@ The profile summary has two sections: **current state** (cheap to rebuild) and *
 Profile Summary = [Current State Section] + [Historical Section]
 ```
 
-| Section | How it's built | When it's rebuilt | Cost |
-|---|---|---|---|
-| **Current state** | Template from `active_profile` (15-30 rows) | After every Aggregator UPSERT | ~1-5ms, zero LLM cost |
-| **Historical context** | LLM summarizes `fact_log` health entries (last 50 rows) | Nightly batch only | ~500ms, ~$0.001 LLM cost |
+| Section                | How it's built                                          | When it's rebuilt             | Cost                     |
+| ---------------------- | ------------------------------------------------------- | ----------------------------- | ------------------------ |
+| **Current state**      | Template from `active_profile` (15-30 rows)             | After every Aggregator UPSERT | ~1-5ms, zero LLM cost    |
+| **Historical context** | LLM summarizes `fact_log` health entries (last 50 rows) | Nightly batch only            | ~500ms, ~$0.001 LLM cost |
 
 ```python
 # After every Aggregator UPSERT:
@@ -915,7 +978,7 @@ async def regenerate_history_section(pet_id: str):
 
 **Why this is simple:** No patching, no severity maps, no complex logic. Current state is always rebuilt from template (~1ms). Historical section is cached and only regenerated nightly. Both combine into one summary string.
 
-### 8.5 Profile Summary Example
+### 9.5 Profile Summary Example
 
 The single combined summary that Health/Food modules receive:
 
@@ -939,28 +1002,29 @@ This gives the Health module everything a doctor would need: who the patient is 
 
 ---
 
-## 9. Redirection Logic — Guardrails & Deep Links
+## 10. Redirection Logic — Guardrails & Deep Links
 
-### 9.1 Why Redirect?
+### 10.1 Why Redirect?
 
 The main chatbot is a **companion**, not a medical or nutritional advisor. If it answered health questions, it would risk:
+
 - Providing incorrect medical advice
 - Creating legal liability
 - Breaking user trust if advice is wrong
 
 Instead, it provides **empathy + immediate handoff** to the specialized module.
 
-### 9.2 Intent Detection
+### 10.2 Intent Detection
 
 The Conversation Agent (or a pre-processing classifier) flags messages as medical/nutritional intent based on keywords and context:
 
-| Intent Type | Example Triggers | Redirect Target |
-|---|---|---|
-| Medical | "vomiting", "bleeding", "lump", "limping", "not eating" | Health Module |
-| Nutritional | "what should I feed", "is X food safe", "diet change" | Food Module |
-| General | "how's your day", "Luna played a lot", "she's happy" | No redirect — normal conversation |
+| Intent Type | Example Triggers                                        | Redirect Target                   |
+| ----------- | ------------------------------------------------------- | --------------------------------- |
+| Medical     | "vomiting", "bleeding", "lump", "limping", "not eating" | Health Module                     |
+| Nutritional | "what should I feed", "is X food safe", "diet change"   | Food Module                       |
+| General     | "how's your day", "Luna played a lot", "she's happy"    | No redirect — normal conversation |
 
-### 9.3 Deep Link with Query Pre-population
+### 10.3 Deep Link with Query Pre-population
 
 **Deep Link** = A URL that navigates the user directly into the target module's chat interface (not just its homepage).
 
@@ -988,6 +1052,7 @@ Rendered in mobile app as:
 ```
 
 When the user taps the button:
+
 1. App navigates to `/health/chat`
 2. Input field pre-filled with: "My dog has been vomiting since morning"
 3. Health Module auto-fetches pet context from Redis
@@ -995,13 +1060,13 @@ When the user taps the button:
 
 ---
 
-## 10. Passive Context Gathering
+## 11. Passive Context Gathering
 
-### 10.1 Purpose
+### 11.1 Purpose
 
-The system's value prop is *"You understand without me having to say everything."* Passive context gathering makes this real by learning from conversations the user has with OTHER modules.
+The system's value prop is _"You understand without me having to say everything."_ Passive context gathering makes this real by learning from conversations the user has with OTHER modules.
 
-### 10.2 How It Works
+### 11.2 How It Works
 
 1. **Nightly cron job** runs (e.g., 3:00 AM)
 2. Fetches last 24h of conversation logs from Health and Food modules
@@ -1010,26 +1075,39 @@ The system's value prop is *"You understand without me having to say everything.
 5. Agent 3 (Aggregator) processes them the same way — append to log, UPSERT if better
 6. Redis summary is regenerated
 
-### 10.3 Example
+### 11.3 Example
 
 **Yesterday (Health Module):**
+
 > User: "The vet prescribed Luna antibiotics for her ear infection."
 > Health Module: "Got it. Make sure she takes them with food..."
 
 **Nightly batch extracts:**
+
 ```json
 [
-  {"key": "medications", "value": "antibiotics (ear infection)", "confidence": 0.85, "source": "passive_health"},
-  {"key": "recent_symptoms", "value": "ear infection", "confidence": 0.80, "source": "passive_health"}
+  {
+    "key": "medications",
+    "value": "antibiotics (ear infection)",
+    "confidence": 0.85,
+    "source": "passive_health"
+  },
+  {
+    "key": "recent_symptoms",
+    "value": "ear infection",
+    "confidence": 0.8,
+    "source": "passive_health"
+  }
 ]
 ```
 
 **Next morning (Main Chatbot):**
+
 > Agent 1: "Hey! How's Luna doing with her ear? Hope the antibiotics are going well~"
 
 The user never told the main chatbot about this. It learned passively.
 
-### 10.4 Safety Considerations
+### 11.4 Safety Considerations
 
 - Passive-extracted facts should have a slightly lower confidence by default (multiply by 0.9) since they come from indirect sources
 - If a passive fact conflicts with a direct user statement, the direct statement always wins
@@ -1037,13 +1115,13 @@ The user never told the main chatbot about this. It learned passively.
 
 ---
 
-## 11. Conversation Context Management
+## 12. Conversation Context Management
 
-### 11.1 The Problem
+### 12.1 The Problem
 
 LLMs have context limits. A user who chats daily for months would generate thousands of messages. We can't pass all of them into Agent 1's prompt every turn.
 
-### 11.2 The Solution — Compressed History
+### 12.2 The Solution — Compressed History
 
 ```
 Raw Conversations (stored in conversation_log table)
@@ -1064,7 +1142,7 @@ Agent 1 receives:
     Total: ~800-1200 tokens of context
 ```
 
-### 11.3 What Compressed History Contains
+### 12.3 What Compressed History Contains
 
 Not raw messages. A semantic summary of the relationship:
 
@@ -1079,23 +1157,23 @@ small changes."
 
 This preserves the **emotional context** and **relationship dynamics** — not the word-by-word transcript.
 
-### 11.4 Compaction Strategy
+### 12.4 Compaction Strategy
 
-| Setting | Value |
-|---|---|
-| **Trigger** | Every 5 sessions OR when raw conversation_log exceeds 3000 tokens |
-| **Compaction model** | Small/fast model (Haiku or GPT-4o-mini) |
-| **Keeps raw logs?** | Yes — conversation_log table is never deleted (append-only for safety) |
-| **Compressed history format** | Natural language paragraph, ~200-400 tokens |
-| **If compaction fails?** | Raw logs are safe in conversation_log. Retry next time. No data loss. |
+| Setting                       | Value                                                                  |
+| ----------------------------- | ---------------------------------------------------------------------- |
+| **Trigger**                   | Every 5 sessions OR when raw conversation_log exceeds 3000 tokens      |
+| **Compaction model**          | Small/fast model (Haiku or GPT-4o-mini)                                |
+| **Keeps raw logs?**           | Yes — conversation_log table is never deleted (append-only for safety) |
+| **Compressed history format** | Natural language paragraph, ~200-400 tokens                            |
+| **If compaction fails?**      | Raw logs are safe in conversation_log. Retry next time. No data loss.  |
 
 ---
 
-## 12. Quality Assurance & Filters
+## 13. Quality Assurance & Filters
 
 The system uses a **three-layer defense-in-depth** approach to ensure the agent never provides medical advice and always stays in character.
 
-### 12.1 Layer 1 — Pre-Processing Intent Classifier (BEFORE Agent 1)
+### 13.1 Layer 1 — Pre-Processing Intent Classifier (BEFORE Agent 1)
 
 A fast keyword-based classifier runs on the user's message BEFORE it reaches Agent 1. This catches obvious medical/nutritional queries early.
 
@@ -1121,11 +1199,11 @@ def classify_intent(message: str) -> str:
 
 If intent is `medical` or `nutritional`, Agent 1 receives an `intent_flag` in its input so it knows to ONLY give empathy + set redirect.
 
-### 12.2 Layer 2 — Prompt Instructions (INSIDE Agent 1)
+### 13.2 Layer 2 — Prompt Instructions (INSIDE Agent 1)
 
-The system prompt explicitly forbids medical advice (see Agent 1 prompt template in Section 4.1). The LLM is instructed to return `intent_flag: "medical"` in its response JSON when it detects health concerns, even if the pre-processing classifier missed it.
+The system prompt explicitly forbids medical advice (see Agent 1 prompt template in Section 5.1). The LLM is instructed to return `intent_flag: "medical"` in its response JSON when it detects health concerns, even if the pre-processing classifier missed it.
 
-### 12.3 Layer 3 — Post-Processing Regex Filter (AFTER Agent 1)
+### 13.3 Layer 3 — Post-Processing Regex Filter (AFTER Agent 1)
 
 Every response passes through automated regex checks BEFORE reaching the user. This is the last line of defense.
 
@@ -1149,27 +1227,27 @@ def filter_response(response: str) -> tuple[bool, list[str]]:
 # If violations found → regenerate with stricter prompt OR fallback to template response
 ```
 
-| Filter | What it catches | Action on violation |
-|---|---|---|
-| **Medical jargon** | "diagnosis", "treatment", "prescription" | Regenerate response with stricter prompt |
-| **Pseudo-diagnosis** | "it sounds like", "it could be [disease]" | Block and redirect to Health module |
-| **Directive advice** | "you should give", "I recommend" | Soften to suggestion: "Maybe we could try~" |
-| **Robotic patterns** | "I understand your concern", "As an AI" | Regenerate response |
-| **Preachy tone** | "You should...", "You need to..." | Soften language |
-| **Question overload** | More than 3 questions in one response | Trim to max 1-2 questions |
+| Filter                | What it catches                           | Action on violation                         |
+| --------------------- | ----------------------------------------- | ------------------------------------------- |
+| **Medical jargon**    | "diagnosis", "treatment", "prescription"  | Regenerate response with stricter prompt    |
+| **Pseudo-diagnosis**  | "it sounds like", "it could be [disease]" | Block and redirect to Health module         |
+| **Directive advice**  | "you should give", "I recommend"          | Soften to suggestion: "Maybe we could try~" |
+| **Robotic patterns**  | "I understand your concern", "As an AI"   | Regenerate response                         |
+| **Preachy tone**      | "You should...", "You need to..."         | Soften language                             |
+| **Question overload** | More than 3 questions in one response     | Trim to max 1-2 questions                   |
 
-### 12.4 Human Review Protocol
+### 13.4 Human Review Protocol
 
-| Phase | Review Rate | Purpose |
-|---|---|---|
-| Pre-launch | 100% of responses reviewed | Calibrate tone, catch systematic issues |
-| Month 1 | 50% sampling | Monitor quality, build confidence |
-| Month 2-3 | 20% sampling | Focus on edge cases and new patterns |
-| Post month 3 | 5% sampling + flagged responses | Ongoing quality maintenance |
+| Phase        | Review Rate                     | Purpose                                 |
+| ------------ | ------------------------------- | --------------------------------------- |
+| Pre-launch   | 100% of responses reviewed      | Calibrate tone, catch systematic issues |
+| Month 1      | 50% sampling                    | Monitor quality, build confidence       |
+| Month 2-3    | 20% sampling                    | Focus on edge cases and new patterns    |
+| Post month 3 | 5% sampling + flagged responses | Ongoing quality maintenance             |
 
 ---
 
-## 13. User Onboarding Flow
+## 14. User Onboarding Flow
 
 There is no traditional form-based onboarding. The system replaces forms with conversation. The Confidence Bar starts at RED and naturally moves toward GREEN over multiple sessions.
 
@@ -1206,58 +1284,20 @@ Step 5: Ongoing (Confidence Bar: 🟢 maintenance)
 
 ---
 
-## 14. Future Roadmap
+## 15. Future Roadmap
 
 ### Short-Term
+
 - **Multi-pet intelligence:** Comparative questions like "Which of my pets eats more?"
 - **Push notifications:** Alert when confidence bar drops to Yellow
 
 ### Medium-Term
+
 - **Voice-to-text interaction:** Speak instead of type
 - **Image context extraction:** Upload a photo of a food bowl → system extracts diet info
 
 ### Long-Term
+
 - **Longitudinal trend detection:** "Luna's appetite has been gradually decreasing over the past month" — proactive notification
 - **Predictive health signals:** Combine behavior patterns to suggest vet visits before problems become visible
 
----
-
-## Appendix A: Technology Stack
-
-### Core Infrastructure
-
-| Layer | Technology | Rationale |
-|---|---|---|
-| **Backend API** | Python (FastAPI) | Async-first for non-blocking LLM calls, strong typing with Pydantic |
-| **Primary Database** | PostgreSQL 16+ | UPSERT support, JSONB columns, robust indexing, battle-tested |
-| **Cache** | Redis 7+ | In-memory key-value, < 5ms reads, TTL, pub/sub for invalidation |
-| **Task Queue** | Redis Streams or BullMQ | Async processing for Compressor + Aggregator pipeline |
-| **Scheduler** | APScheduler (Python) or Cloud Scheduler | Nightly batch jobs, confidence decay cron |
-
-### AI / LLM Layer
-
-| Component | Technology | Cost (approx.) | Latency |
-|---|---|---|---|
-| Agent 1 (Conversation) | GPT-4o / Claude 3.5 Sonnet | ~$0.005/turn | ~1-2s |
-| Agent 2 (Compressor) | GPT-4o-mini / Claude Haiku | ~$0.0001/turn | ~200-500ms |
-| Agent 3 (Aggregator) | Application code (no LLM) | $0 | ~5ms |
-| Regex entity gate | Python `re` module | $0 | ~1ms |
-| History section generation | GPT-4o-mini / Haiku (nightly) | ~$0.001/pet/day | ~500ms |
-| Conversation compaction | GPT-4o-mini / Haiku | ~$0.001/compaction | ~500ms |
-
-### Guardrails & Quality
-
-| Component | Technology | Rationale |
-|---|---|---|
-| Intent classifier (Layer 1) | Keyword regex (Python) | Zero cost, instant, catches obvious cases |
-| Prompt guardrails (Layer 2) | System prompt instructions | Part of LLM call, no extra cost |
-| Response filter (Layer 3) | Regex patterns (Python) | Fast, predictable, no LLM cost |
-| LLM observability | Langfuse or LangSmith | Track cost, latency, quality per agent |
-
-### Summary Generation
-
-| Component | Technology | Rationale |
-|---|---|---|
-| Current state section | Template-based (Python f-strings) | ~1ms, zero LLM cost, rebuilt every update |
-| History section | LLM summarization (nightly) | Needs narrative generation from raw facts |
-| Profile summary | Combination of above two | One artifact for external modules |

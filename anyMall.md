@@ -24,7 +24,8 @@
 13. [Quality Assurance & Filters (Three-Layer Defense)](#13-quality-assurance--filters)
 14. [User Onboarding Flow](#14-user-onboarding-flow)
 15. [Future Roadmap](#15-future-roadmap)
-16. [Architecture Decisions & PRD Gap Log](#16-architecture-decisions--prd-gap-log) *(new)*
+16. [Architecture Decisions & PRD Gap Log](#16-architecture-decisions--prd-gap-log)
+17. [Change Log — What We Changed and Why](#17-change-log--what-we-changed-and-why) *(new)*
 
 > **Notes:**
 >
@@ -457,8 +458,18 @@ Total context: ~900-1700 tokens — well within limits
 | **Model**          | GPT-4o-mini or Claude Haiku for prototype. **Note:** The PRD recommends a full model (GPT-4o / Claude Sonnet) for Agent 2, arguing that structured extraction errors compound downstream. Since the two-gate filter (regex + Agent 1 entity_detected) already skips ~50-60% of messages before this agent runs, a full model is more affordable than it appears. Revisit this decision after evaluating prototype extraction quality. |
 | **When called**    | Only if BOTH gates pass: (1) regex pre-filter detects entity patterns AND (2) Agent 1 outputs `entity_detected: true`. If Agent 1 says `entity_detected: false`, skip even if regex passed — Agent 1 has full context and is a smarter filter. |
 | **Input (API)**    | `Compressor.run(message: str, pet_id: str)` — `pet_id` is a routing parameter for the Aggregator. It is **never passed to the LLM**. |
-| **Input (LLM)**    | User message text + output schema (field names + descriptions). No pet context, no history. The LLM extracts only what's in the current message. |
+| **Input (LLM)**    | User message text + output schema (field names + descriptions). **No pet context. No gap_list. No history.** The LLM extracts only what is explicitly in the current message. |
 | **Output**         | Array of `{key, value, confidence, time_scope, uncertainty, source_quote, timestamp}` |
+
+> **Q: Why doesn't the Compressor receive the gap_list or pet profile?**
+>
+> **A: Because it's not the Compressor's job.** The Compressor has one job: read a message, extract structured facts from it. That's it.
+>
+> - The **gap_list** belongs to Agent 1 — Agent 1 is the one talking to the user and deciding what to ask next. Agent 1 needs to know what's missing so it can ask smart follow-up questions.
+> - The **pet profile** belongs to Agent 1 — it needs profile context to respond naturally. The Compressor doesn't respond to anyone; it just extracts.
+> - Giving the Compressor the pet profile or gap_list would: (a) inflate its context window cost on every call, (b) risk the LLM "filling in" facts from context rather than extracting what the user actually said — a hallucination risk.
+>
+> Keep Compressor stateless and message-scoped. Agent 1 handles awareness. Agent 3 handles storage decisions.
 
 #### Regex Pre-filter (Skip unnecessary LLM calls)
 
@@ -766,11 +777,17 @@ async def build_agent_context(pet_id: str, session_id: str, user_message: str) -
 
     active_profile = deserialize(profile_json)
 
-    # Step 2: Get compressed history (pet facts from past sessions)
-    compressed = await db.query_one(
-        "SELECT summary FROM compressed_history WHERE pet_id = $1 ORDER BY created_at DESC LIMIT 1",
+    # Step 2: Get both types of compressed history for this pet
+    # session_compact = recent sessions summary (built from RAW CONVERSATION MESSAGES)
+    # longitudinal    = long-term trend summary (built from fact_log entries, monthly batch)
+    history_rows = await db.query(
+        """SELECT DISTINCT ON (summary_type) summary, summary_type, created_at
+           FROM compressed_history WHERE pet_id = $1
+           ORDER BY summary_type, created_at DESC""",
         pet_id
     )
+    session_compact   = next((r["summary"] for r in history_rows if r["summary_type"] == "session_compact"), None)
+    longitudinal_hist = next((r["summary"] for r in history_rows if r["summary_type"] == "longitudinal"), None)
 
     # Step 3: Get current session messages (only this session, not all history)
     session_msgs = await db.query(
@@ -779,7 +796,9 @@ async def build_agent_context(pet_id: str, session_id: str, user_message: str) -
     )
 
     # Step 4: Compute gap list from active_profile vs priority schema
-    all_priority_keys = get_priority_keys_by_rank()  # Rank A → B → C
+    # Gap list is computed HERE in the context builder and injected into Agent 1.
+    # Agent 2 (Compressor) never receives the gap list — it only extracts what the user said.
+    all_priority_keys = get_priority_keys_by_rank()  # Rank A → B → C (excludes transient + Rank E)
     filled_keys = {row["key"] for row in active_profile}
     missing = [k for k in all_priority_keys if k not in filled_keys]
 
@@ -792,29 +811,26 @@ async def build_agent_context(pet_id: str, session_id: str, user_message: str) -
 
     gap_list = (missing + stale_keys)[:3]  # Top 3 gaps for this session
 
-    # Step 5: Get relationship context (user-level emotional/behavioral summary)
-    # This is about the USER, not the pet — tone, anxiety level, session count, preferences
+    # Step 5: Get relationship context (user-level behavioral/emotional NL summary)
+    # Format: natural language paragraph (~100-150 words), NOT a structured schema.
+    # Generated by the compaction job (Section 12.6) — NOT extracted per-message.
     user_id = await db.query_one("SELECT user_id FROM pet WHERE id = $1", pet_id)
     rel_context = await db.query_one(
         "SELECT summary, session_count, last_updated FROM user_relationship_context WHERE user_id = $1",
         user_id["user_id"]
     )
 
-    # Step 6: Determine message_reading_key
-    # True if pre-processing layer already flagged this as high-importance (medical/critical)
-    # In prototype this is set by Layer 1 intent classifier in API gateway
-    message_reading_key = await redis.get(f"session:{session_id}:message_reading_key") == "true"
-
-    # Step 7: Assemble and return
+    # Step 6: Assemble and return
+    # message_reading_key removed — redundant with intent_flag (see Section 16.4)
     return {
+        "pet": await db.query_one("SELECT name, species, breed, life_stage FROM pet WHERE id = $1", pet_id),
         "active_profile": format_profile_for_prompt(active_profile),
-        "compressed_history": compressed["summary"] if compressed else "First session with this pet.",
+        "compressed_history": session_compact or "First session with this pet.",
+        "longitudinal_history": longitudinal_hist or "",  # empty on new users — Agent 1 handles gracefully
         "relationship_context": rel_context["summary"] if rel_context else "New user — no interaction history yet.",
         "gap_list": gap_list,
         "current_session": session_msgs,
         "user_message": user_message,
-        "life_stage": pet["life_stage"],
-        "message_reading_key": message_reading_key,
     }
 ```
 
@@ -839,16 +855,57 @@ def is_stale(updated_at: datetime, life_stage: str) -> bool:
 
 ## 6. Data Architecture
 
-### 6.1 Two-Layer Storage Design
+### 6.1 Storage Strategy — What Gets Appended, What Gets Updated
 
-The system uses **two layers** to balance auditability with performance:
+**Q: Do we append conversation sessions AND pet/user profile data? Where does everything go?**
+
+**Our approach: Five stores, three distinct write patterns.**
+
+```
+┌────────────────────────────┬───────────────┬─────────────────────────────────────────────────────┐
+│ Store                      │ Write Pattern │ What it holds                                       │
+├────────────────────────────┼───────────────┼─────────────────────────────────────────────────────┤
+│ conversation_log           │ APPEND        │ Raw messages (every user + assistant turn)           │
+│                            │ (never touch) │ Purpose: compaction source, audit, rollback          │
+├────────────────────────────┼───────────────┼─────────────────────────────────────────────────────┤
+│ fact_log                   │ APPEND        │ Every structured fact ever extracted                 │
+│                            │ (never touch) │ Includes superseded and historical facts             │
+│                            │               │ Purpose: audit, rollback, trend analysis             │
+├────────────────────────────┼───────────────┼─────────────────────────────────────────────────────┤
+│ active_profile             │ UPSERT        │ Current best-known value per (pet_id, key)           │
+│  [CURRENT PET STATE]       │ (one row/key) │ This IS the "pet's current profile"                  │
+│                            │               │ Rows never grow beyond # of defined keys             │
+├────────────────────────────┼───────────────┼─────────────────────────────────────────────────────┤
+│ compressed_history         │ APPEND        │ summary_type="session_compact" → recent sessions     │
+│  [PET NARRATIVE]           │ (new row each │ summary_type="longitudinal"    → long-term trends    │
+│                            │  compaction)  │ Old summaries kept — new ones added alongside        │
+├────────────────────────────┼───────────────┼─────────────────────────────────────────────────────┤
+│ user_relationship_context  │ UPDATE        │ NL summary of user's communication style/patterns    │
+│  [CURRENT USER PROFILE]    │ (one row/user)│ One row per user. Overwritten on each compaction.    │
+│                            │               │ Only store that is truly replaced, not appended      │
+└────────────────────────────┴───────────────┴─────────────────────────────────────────────────────┘
+```
+
+**In plain terms — what actually gets stored where:**
+
+- **Conversation session?** → Raw messages append to `conversation_log`. Session data is ONLY for compaction input and audit. It is never read at conversation time.
+- **Extracted pet facts?** → Always appended to `fact_log` (audit trail). The WINNER also UPSERTs `active_profile`.
+- **Current pet profile?** → Lives in `active_profile`. Structured, one row per key. This is what Agent 1 reads every turn.
+- **Pet history / trends?** → Lives in `compressed_history`. Two types: session narrative (from raw messages) and long-term trends (from fact_log). Both are NL paragraphs.
+- **User profile?** → Lives in `user_relationship_context`. ONE row per user. NL summary, rebuilt by compaction, overwritten each time (not appended — we only need the latest behavioral summary).
+
+**There is no "current user profile" in the same sense as the pet profile.** The user doesn't have a structured key-value table of user attributes. They have a single NL paragraph summarizing how they communicate — because user behavior is a narrative, not a schema.
+
+### 6.2 Two-Layer Pet Data Design
+
+The system uses **two layers** specifically for pet facts to balance auditability with performance:
 
 | Layer                                    | Purpose                                                                                                       | Write Pattern                        | Read Pattern                                                       |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------------------------ |
 | **fact_log** (JSONL / append-only table) | Full history of every fact ever extracted. Used for audit, rollback, trend analysis, conversation compaction. | APPEND only — never update or delete | Rarely read in real-time. Used by nightly jobs and trend analysis. |
 | **active_profile** (computed view table) | Current best-known value for each unique key per pet. This is what agents actually use.                       | UPSERT — one row per (pet_id, key)   | Read every conversation turn. Fast indexed lookups.                |
 
-### 6.2 Why Append-Only?
+### 6.3 Why Append-Only?
 
 - **Rollback safety:** If Agent 2 hallucinates a fact, the old correct value still exists in the log. We revert the active_profile entry and point it at the previous log row.
 - **Trend analysis:** "Luna's appetite has been declining over 3 months" — requires historical rows.
@@ -876,11 +933,11 @@ CREATE TRIGGER no_update_fact_log
 
 At the application layer, the `fact_log` repository exposes only an `insert()` method — no `update()` or `delete()`.
 
-### 6.3 Why active_profile Doesn't Grow Unboundedly
+### 6.4 Why active_profile Doesn't Grow Unboundedly
 
 The active_profile has a `PRIMARY KEY (pet_id, key)`. The number of rows per pet = number of unique keys you define (typically 15-30). It never grows beyond that. The fact_log grows over time but is never read in real-time conversation flows.
 
-### 6.4 PostgreSQL Schema
+### 6.5 PostgreSQL Schema
 
 ```sql
 -- ============================================
@@ -955,19 +1012,23 @@ CREATE INDEX idx_convo_pet_session
 
 
 -- ============================================
--- COMPRESSED HISTORY — summarized past sessions (PET facts)
+-- COMPRESSED HISTORY — NL summaries of pet history (two types)
 -- ============================================
 CREATE TABLE compressed_history (
-    id            SERIAL PRIMARY KEY,
-    pet_id        UUID NOT NULL,
-    summary       TEXT NOT NULL,                -- LLM-generated summary of past conversations (about the PET)
-    sessions_covered UUID[] NOT NULL,           -- which session_ids were compacted
-    token_count   INT,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id               SERIAL PRIMARY KEY,
+    pet_id           UUID NOT NULL,
+    summary_type     VARCHAR(20) NOT NULL DEFAULT 'session_compact',
+    --   'session_compact' → built from raw conversation_log messages after every N sessions
+    --   'longitudinal'    → built from fact_log entries by weekly/monthly batch job
+    summary          TEXT NOT NULL,
+    sessions_covered UUID[],                    -- session_ids covered (session_compact only)
+    token_count      INT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_compressed_pet
-    ON compressed_history(pet_id, created_at DESC);
+-- Fetch latest of each type efficiently:
+CREATE INDEX idx_compressed_pet_type
+    ON compressed_history(pet_id, summary_type, created_at DESC);
 
 
 -- ============================================
@@ -989,7 +1050,7 @@ CREATE TABLE user_relationship_context (
 -- Built by LLM summarizing user's tone, patterns, and emotional history across sessions
 ```
 
-### 6.5 Aggregator UPSERT Example
+### 6.6 Aggregator UPSERT Example
 
 ```sql
 -- The Aggregator runs this after deciding the new fact wins:
@@ -1492,9 +1553,18 @@ Agent 1 receives:
     Total: ~800-1200 tokens of context
 ```
 
-### 12.3 What Compressed History Contains
+### 12.3 What Compressed History Contains — and How It's Built
 
-Not raw messages. A semantic summary of the relationship:
+**Q: Is compressed_history a summary of the full conversation, or of the extracted entities?**
+
+**A: It is built from RAW CONVERSATION MESSAGES — not from extracted entities.**
+
+| Summary Type      | Built from                        | Why not the other?                              |
+| ----------------- | --------------------------------- | ----------------------------------------------- |
+| `session_compact` | Raw messages in `conversation_log` | Entities give you WHAT was said. Raw messages give you HOW — emotional tone, follow-ups, owner anxiety, relationship patterns. Summarizing only entities would produce a dry clinical summary that loses relationship context. |
+| `longitudinal`    | `fact_log` entries (structured)   | Trends require timestamped, structured data. Raw messages don't carry timestamps per-fact — fact_log does. |
+
+The `session_compact` summary is what Agent 1 calls "compressed_history". It is NOT the word-by-word transcript. It is a semantic paragraph capturing:
 
 ```
 "User has been chatting about Luna (Shiba Inu, 2y) for 3 months.
@@ -1505,7 +1575,13 @@ Owner prefers short conversations and appreciates when the system notices
 small changes."
 ```
 
-This preserves the **emotional context** and **relationship dynamics** — not the word-by-word transcript.
+This preserves **emotional context** and **relationship dynamics** — which extracted entities alone cannot represent.
+
+**Why RAW messages work better than entity summaries for session_compact:**
+- "Luna seems a bit tired maybe?" → Entity: `energy_level: low (confidence 0.5)`. But the RAW message tells the compactor: owner was uncertain, hedging, not alarmed. That nuance matters for Agent 1's tone.
+- Entity extraction flattens everything into confident facts. Raw conversation preserves uncertainty, emotion, and conversational flow.
+
+The `longitudinal` summary works the opposite way — it needs the structured `fact_log` to detect trends like "weight has been dropping across 6 months" or "energy mentions have increased in frequency."
 
 ### 12.4 Compaction Strategy
 
@@ -1649,6 +1725,19 @@ follows up on previous topics in the next session. Has been using the app
 for 3 months with consistent daily engagement. Uses informal language,
 frequently includes emotions ('I'm so worried', 'she's doing great today')."
 ```
+
+**Q: Is relationship_context a structured schema or a natural language summary?**
+
+**Decision: Natural Language (NL) summary — NOT a structured schema.**
+
+| Option               | Pros                                     | Cons                                       | Decision |
+| -------------------- | ---------------------------------------- | ------------------------------------------ | -------- |
+| Structured schema    | Queryable, programmatic access           | User behavior doesn't fit clean fields; requires re-serialization before injecting into prompt | ✗ Rejected |
+| NL summary (~100-150 words) | Directly injectable into Agent 1's prompt; captures nuance that doesn't fit into keys | Not queryable | ✓ **Chosen** |
+
+The NL format is injected directly into Agent 1's `## User Relationship Context` prompt section without transformation. No parsing or re-serialization needed.
+
+**Storage:** One row per user in `user_relationship_context.summary` (TEXT column). Updated after each compaction run — not per-message. This is the ONLY mutable single-row store in the system (everything else either appends or UPSERTs per key).
 
 This feeds directly into Agent 1's `relationship_context` input, enabling tone-matched, personalized responses without any per-message overhead.
 
@@ -1844,3 +1933,78 @@ The PRD does not explicitly address user consent for passive context gathering f
 ### 16.9 Household vs Per-Pet Confidence Bar (PRD Improvement Proposal)
 
 **Our proposal:** Build per-pet confidence bars as the primary metric. Expose a household-level aggregate as a secondary computed metric (average of all pet scores in the household). This gives multi-pet households a single "how well do you know all your pets?" indicator while preserving per-pet granularity.
+
+---
+
+## 17. Change Log — What We Changed and Why
+
+This section is a running log of every significant design decision made during the document evolution. Intended to help team members understand not just what the design is, but why it is the way it is.
+
+### 17.1 Agent 1 — Input Restructured
+
+| What changed | `inputs` table now explicitly lists: `pet` (object), `active_profile_rows`, `compressed_history`, `relationship_context`, `current_session`, `gap_list`, `user_message` |
+| --- | --- |
+| **Why** | Previous version listed inputs as a flat comma-separated string. Team was unclear which inputs existed and what each contained. Restructured to match the actual `build_agent_context()` function output, with each input individually defined. |
+| **Source of confusion** | `gap_list` was previously described as computed "in the Compressor" — this was wrong. Compressor never computes gaps. Gaps are computed by `build_agent_context()` and passed to Agent 1. Fixed. |
+
+### 17.2 Agent 1 — `entity_detected` Added to Output
+
+| What changed | Agent 1 now outputs `entity_detected: bool` in addition to `message`, `intent_flag`, `questions_asked_count` |
+| --- | --- |
+| **Why** | We needed a smarter gate for calling Agent 2. Regex catches obvious skips but can't judge context (e.g., "does she like kibble?" matches regex but contains no extractable fact). Agent 1, with full pet profile context, can judge whether something is a new fact worth extracting. `entity_detected: false` skips Agent 2 entirely. |
+| **How it fits** | Creates a two-gate filter: regex (cheap, fast, ~1ms) → Agent 1 entity_detected (smart, context-aware). Both gates must pass to call Agent 2. |
+
+### 17.3 Agent 1 — `message_reading_key` Removed from Inputs
+
+| What changed | `message_reading_key` boolean removed from Agent 1 inputs |
+| --- | --- |
+| **Why** | Redundant. Layer 1 intent classifier (Section 13.1) already runs BEFORE Agent 1 and sets `intent_flag = "medical"` on high-importance messages. Agent 1 already adjusts tone from `intent_flag`. Adding a second boolean carrying the same signal adds complexity with no benefit. |
+| **Risk** | None. Agent 1 already handles this via intent_flag. |
+
+### 17.4 Agent 2 — Clarified: `pet_id` Is Routing-Only, Never Sent to LLM
+
+| What changed | Explicit note added: `Compressor.run(message: str, pet_id: str)` — `pet_id` never reaches the LLM |
+| --- | --- |
+| **Why** | `pet_id` is needed to route extracted facts to the right Aggregator call. But the LLM itself should receive ONLY the user message + output schema. Sending pet_id to the LLM adds no value and could encourage the model to "fill in" context it doesn't have. |
+
+### 17.5 Agent 2 — `gap_list` Does NOT Belong Here
+
+| What changed | Explicit rationale added in Section 5.2 explaining why Agent 2 receives no gap_list, no pet profile, no history |
+| --- | --- |
+| **Why** | Agent 2 has one job: extract what the USER said. Not what we need. Not what we don't know. Pure extraction from the current message. Giving it the gap_list risks the model extracting "what we want to hear" rather than "what was actually said" — a subtle hallucination risk. The gap_list belongs to Agent 1 only, which uses it to ask smart follow-up questions. |
+
+### 17.6 Agent 2 — Entity Schema Expanded
+
+| What changed | Added new fields across all ranks: `neutered_spayed`, `vaccination_status` (Rank A); `current_weight`, `sleep_pattern` (Rank B, sleep_pattern was previously missing from schema); `behavioral_issues`, `social_behavior`, `sleep_location` (Rank C); `health_events` (Rank D). Rank E changed from `happiest_moment`/`unforgettable_memory` to `owner_nickname`, `favorite_activity`, `fears`, `comfort_items`. Added new Transient State category: `energy_level`, `appetite`. |
+| --- | --- |
+| **Why** | Original schema was missing clinically relevant fields. `neutered_spayed` and `vaccination_status` are critical medical baselines that any vet would ask first. `sleep_pattern` existed in UI labels but was missing from the extraction schema — a gap. Transient fields separated because they decay in 1-3 days and would distort the confidence bar's coverage score if treated as regular profile gaps. |
+
+### 17.7 Compressed History — Two Types Distinguished (`summary_type` Column)
+
+| What changed | `compressed_history` table now has `summary_type` column: `"session_compact"` (per N sessions, from raw messages) and `"longitudinal"` (weekly/monthly, from fact_log). Agent 1 receives both. |
+| --- | --- |
+| **Why** | These serve fundamentally different purposes. Session compact gives recent emotional/relationship context. Longitudinal gives long-term health trend narrative. They're built from different sources (raw messages vs. fact_log entries) and at different cadences. Storing them in the same table with a type column avoids creating a new table while keeping them cleanly separated. |
+| **Why raw messages for session_compact, not extracted entities?** | Entities give you WHAT was said. Raw messages preserve HOW — tone, uncertainty, owner anxiety, follow-up patterns. Summarizing only entities would produce a dry clinical summary that loses relationship dynamics. Agent 1 needs the emotional context, not just the fact list. |
+| **Why fact_log for longitudinal?** | Trends require timestamped structured data. Raw messages don't carry per-fact timestamps. fact_log does. You can't detect "Luna's energy mentions have increased over 3 months" from raw text — you need the structured extract. |
+
+### 17.8 User Relationship Context — Format Decision: NL Summary, Not Structured Schema
+
+| What changed | Explicit decision documented in Section 12.6: `user_relationship_context.summary` is a natural language paragraph (~100-150 words), not a structured key-value schema |
+| --- | --- |
+| **Why NL over structured schema?** | User behavior is nuanced and doesn't map cleanly to fixed fields. A structured schema (e.g., `{"tone": "anxious", "preferred_response_length": "short"}`) loses the relational context between attributes. A NL paragraph ("Owner tends to be anxious, especially about health, and prefers short reassuring replies in the evenings") is directly injectable into Agent 1's prompt without transformation. |
+| **How it's generated** | By the compaction job's second task (Section 12.6), which reads the same raw conversation messages as the session compact but looks for USER behavioral signals, not pet facts. NOT extracted per-message. |
+| **Storage** | One row per user. Overwritten on each compaction. This is the ONLY store in the system that is truly replaced rather than appended — because we only ever need the LATEST user behavioral summary, not a history of old ones. |
+
+### 17.9 Storage Strategy — Clarified Five Stores
+
+| What changed | Section 6.1 restructured to explicitly answer: what gets APPENDED, what gets UPSERTED, what gets OVERWRITTEN. Five stores clearly defined with write patterns. |
+| --- | --- |
+| **Why** | Previous Section 6 described only two layers (fact_log + active_profile). The team had questions about where conversation sessions, pet trends, and user profiles go. Now all five stores are explicitly framed. |
+| **Key clarification** | `conversation_log` and `fact_log` are pure append-only audit logs — they are NEVER read at conversation time. `active_profile` is the "current pet profile" — structured, one row per key. `compressed_history` holds pet NL narratives (two types). `user_relationship_context` holds the current user behavioral summary — the only store that is overwritten. |
+
+### 17.10 User Profile Extraction — via Compaction, Not Per-Message
+
+| What changed | Section 12.6 added: explains that user behavioral signals are NOT extracted per-message by Agent 2. They are inferred by the compaction job reading the same raw messages it uses for the session_compact summary. |
+| --- | --- |
+| **Why not per-message?** | A single message tells you nothing reliable about a user's communication style. The pattern across 20+ messages does. Per-message extraction would add LLM cost on every turn and produce noisy, unreliable individual observations. |
+| **The compaction job runs TWO tasks in one pass:** Task 1 → pet history compact (session_compact summary). Task 2 → user signal extraction (updates user_relationship_context). Same input (raw messages), different output schemas. |

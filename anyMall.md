@@ -1,117 +1,3 @@
-# Pet Health Companion — System Design Document
-
-## Table of Contents
-
-1. [My Approach](#1-my-approach)
-2. [Delivery Plan](#2-delivery-plan)
-3. [System Architecture Diagram](#3-system-architecture-diagram)
-4. [Data Flow Diagram (Sequence)](#4-data-flow-diagram-sequence)
-5. [Core Agents — The Three-Agent Pipeline](#5-core-agents--the-three-agent-pipeline)
-   - 5.1 [Agent 1: Conversation Agent](#51-agent-1-conversation-agent)
-   - 5.2 [Agent 2: Compressor](#52-agent-2-compressor)
-   - 5.3 [Agent 3: Aggregator](#53-agent-3-aggregator)
-   - 5.4 [Context Building Strategy](#54-context-building-strategy)
-6. [Data Architecture](#6-data-architecture)
-7. [Confidence Bar — Calculation Logic](#7-confidence-bar--calculation-logic)
-   - 7.5 [Depth Score Calculation](#75-depth-score-calculation)
-   - 7.6 [Complete Calculation Example](#76-confidence-bar-calculation--complete-example)
-8. [Information Priority Schema](#8-information-priority-schema) *(includes Rank D)*
-9. [Integration with Specialized Modules](#9-integration-with-specialized-modules)
-10. [Redirection Logic — Guardrails & Deep Links](#10-redirection-logic--guardrails--deep-links) *(urgency field added)*
-11. [Passive Context Gathering](#11-passive-context-gathering)
-12. [Conversation Context Management](#12-conversation-context-management)
-    - 12.5 [Session Management](#125-session-management) *(new)*
-13. [Quality Assurance & Filters (Three-Layer Defense)](#13-quality-assurance--filters)
-14. [User Onboarding Flow](#14-user-onboarding-flow)
-15. [Future Roadmap](#15-future-roadmap)
-16. [Architecture Decisions & PRD Gap Log](#16-architecture-decisions--prd-gap-log)
-17. [Change Log — What We Changed and Why](#17-change-log--what-we-changed-and-why) *(new)*
-
-> **Notes:**
->
-> - **Evaluation strategy** is documented separately in [evaluation-strategy.md](evaluation-strategy.md) and will be reviewed and incorporated as the prototype matures.
-> - **Technology stack** choices (Python/FastAPI, PostgreSQL, Redis, GPT-4o/Claude Sonnet for Agent 1, GPT-4o-mini/Haiku for Agent 2, deterministic code for Agent 3 in the prototype — designed with a clean interface so it can be upgraded to an LLM reasoning model later) are documented in context within each section rather than as a separate appendix.
-> - **Language:** The primary language of AnyMall-chan is **Japanese**; English is secondary. All Agent 1 prompts, character voice, and response guidelines must reflect Japanese-first. This is currently a placeholder note — full Japanese prompt engineering is deferred to MVP phase.
-> - **Cost estimation and production monitoring** are intentionally deferred until MVP is validated and scaling decisions become concrete.
-
----
-
-## 1. My Approach
-
-### How I Think About Building
-
-For every technical problem, my process follows the same discipline:
-
-**Understand first, build second.** Before I write a single line of code, I need the full picture — the product vision, the users, every building block, and how they fit together. I break the problem into components, identify the unknowns, and document my understanding. This document itself is that process in action.
-
-### The Process
-
-```
-Step 1: Understand the Problem
-├── Read the PRD. Not skim — read.
-├── Identify every feature, constraint, and user expectation
-├── Break down the system into components
-├── Map how components interact with each other
-└── Ask questions about anything unclear BEFORE designing
-
-Step 2: Document the Design
-├── Write a system design document (this document)
-├── Draw architecture diagrams and data flows
-├── Define data models, API contracts, and prompt templates
-├── Think through edge cases and trade-offs ON PAPER
-└── Get alignment from the team before coding
-
-Step 3: Build a Prototype (Internal Review)
-├── Build the riskiest/hardest component first
-├── Get it working end-to-end, even if rough
-├── Internal team reviews: does the approach work?
-├── Catch fundamental design mistakes early
-└── Prototype is throwaway — it's for learning, not shipping
-
-Step 4: Build the MVP (User Testing)
-├── Rebuild with production patterns informed by prototype learnings
-├── Ship the minimum slice that delivers the core value prop
-├── Test with real users — does it actually feel like
-│   "You understand without me having to say everything"?
-└── Collect feedback and measure quality (see Evaluation Strategy)
-
-Step 5: Iterate to Maturity
-├── Each iteration adds one capability layer
-├── Update this document as assumptions get validated or invalidated
-├── Keep the document as living history — don't delete old decisions,
-│   annotate why they changed
-└── Gradually move from MVP to production quality
-```
-
-### Why This Approach Works for THIS Problem
-
-This system is a **multi-agent AI product**. Multi-agent systems have a specific challenge: you can't predict how LLMs will behave until you run them. The Compressor might hallucinate facts. The Conversation Agent might accidentally give medical advice. The Aggregator's conflict resolution logic might not match real-world patterns.
-
-**You can't design this perfectly upfront.** You MUST prototype, test, measure, and iterate. But you also can't just start coding blindly — without understanding the full system, you'll build components that don't fit together.
-
-This approach balances both: **think deeply upfront, then validate quickly through iteration.**
-
----
-
-## 2. Delivery Plan
-
-```
-PROTOTYPE (Weeks 1-3)                    MVP (Weeks 4-8)
-Internal review only                     Real users testing
-─────────────────────                    ────────────────────
-Goal: Prove the 3-agent                 Goal: Deliver core value
-pipeline works end-to-end               "You understand without
-                                        me having to say everything"
-
-                    ITERATE (Weeks 9+)
-                    Feature-by-feature
-                    ─────────────────────
-                    Goal: Add modules,
-                    polish, scale
-```
-
----
-
 ## 3. System Architecture Diagram
 
 ```mermaid
@@ -760,6 +646,65 @@ The same pattern applies to the user: `user_relationship_context` holds user beh
 
 This is the logic that assembles everything Agent 1 needs before each response. It runs on every user message.
 
+#### Why `pet` and `active_profile_rows` are two separate things — and the typed struct that unifies them
+
+**Q: Can we have one schema for everything? Why does Agent 1 receive `pet` AND `active_profile_rows` as two separate inputs?**
+
+They are stored in two tables for good reasons, but merged into one typed struct before reaching Agent 1:
+
+| | `pet` table | `active_profile` table |
+|---|---|---|
+| **What it holds** | Identity — who this pet is | Knowledge — what we've learned about this pet |
+| **Set by** | User at signup (form) | Agent 2 + Agent 3 pipeline (extracted from conversation) |
+| **Changes?** | Almost never (`name`, `species`, `breed` permanent; `life_stage` computed from DOB) | Constantly — new facts arrive every session |
+| **Schema type** | Fixed typed columns | Flexible key-value rows — new fields added without DB migration |
+| **Examples** | `name: "Luna"`, `species: "dog"`, `life_stage: "adult"` | `diet_type: "raw food"`, `chronic_illness: "none"`, `medications: "antibiotics"` |
+
+**At the code layer:** `build_agent_context()` merges both into one typed `AgentContext` struct — Agent 1 always receives a single clean object, not two separate dicts:
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+
+@dataclass
+class PetIdentity:
+    """Immutable fields from the `pet` table. Set at signup. NEVER extracted by Agent 2."""
+    id: str
+    name: str
+    species: str        # "dog", "cat"
+    breed: str
+    life_stage: str     # "puppy", "junior", "adult", "senior" — computed from date_of_birth
+
+@dataclass
+class ProfileFact:
+    """One extracted fact from `active_profile`. One row per (pet_id, key)."""
+    key: str            # "diet_type", "chronic_illness", "medications", etc.
+    value: str
+    confidence: float
+    updated_at: datetime
+
+@dataclass
+class AgentContext:
+    """
+    Complete context passed to Agent 1. Merges identity (pet table) + learned knowledge
+    (active_profile) into one typed structure.
+
+    pet     ← FROM pet table       — who the pet IS (permanent identity)
+    profile ← FROM active_profile  — what we KNOW about the pet (learned from conversation)
+    These are different concepts. They stay as two DB tables. They merge into one struct here.
+    """
+    pet: PetIdentity
+    profile: list[ProfileFact]       # Rank A–E + Transient facts from active_profile
+    compressed_history: str          # recent sessions NL summary
+    longitudinal_history: str        # long-term trend NL summary (empty if new user)
+    relationship_context: str        # user behavioral NL summary
+    gap_list: list[str]              # top 3 missing/stale Rank A/B/C keys
+    current_session: list[dict]      # messages in current session only
+    user_message: str                # message being processed
+```
+
+> **Rule:** `pet.name`, `pet.species`, `pet.breed`, `pet.life_stage` are **never** extracted by Agent 2. They are set at signup via form and live only in the `pet` table. Agent 2 extracts only Rank A–E and Transient keys — things learned from conversation, not static identity.
+
 ```python
 async def build_agent_context(pet_id: str, session_id: str, user_message: str) -> dict:
     """Build the full context for Agent 1 (Conversation Agent)."""
@@ -1079,11 +1024,33 @@ Confidence Score = (Coverage × 0.4) + (Recency × 0.3) + (Depth × 0.3)
 
 | Component    | Weight | What it measures                                        | How it's calculated                                      |
 | ------------ | ------ | ------------------------------------------------------- | -------------------------------------------------------- |
-| **Coverage** | 40%    | How many priority items (Rank A/B/C) have been answered | `answered_items / total_priority_items`                  |
-| **Recency**  | 30%    | How fresh is the data                                   | Weighted average of individual item freshness scores     |
-| **Depth**    | 30%    | How detailed are the answers                            | Based on word count + semantic richness of stored values |
+| **Coverage** | 40%    | How many priority items (Rank A/B/C) have been answered, weighted by rank | `(A_filled×4 + B_filled×2 + C_filled×1) / (A_total×4 + B_total×2 + C_total×1)`. Current schema: 7A+5B+6C → max 44 pts. New fields enter a 30-day bonus bucket on schema update (see §7.12). |
+| **Recency**  | 30%    | How fresh is the data                                   | Weighted average of item freshness. Decay-exempt keys (`neutered_spayed`, `vaccination_status`) always score 1.0 once filled — they never decay (see §7.9). `species` and `breed` are NOT here — they live in the `pet` table, not `active_profile`. |
+| **Depth**    | 30%    | How detailed are the answers                            | Average depth score across filled A/B/C keys. **Not capped at 1.0** — rich profiles that average above 1.0 on depth give a real boost. Final confidence score is capped at 100% in the UI layer. |
 
 ### 7.3 Recency Decay Table
+
+> **Decay-exempt keys** — `neutered_spayed`, `vaccination_status`. These are permanent one-time facts in `active_profile` that never change after being recorded. Once filled, they score `recency = 1.0` regardless of data age. They skip the table below entirely. (`species` and `breed` live in the `pet` table — they are not `active_profile` keys and cannot be decay-exempt.) Full rationale and implementation reference in §7.9.
+
+```python
+DECAY_EXEMPT_KEYS = {"neutered_spayed", "vaccination_status"}
+# Only keys in `active_profile` can be decay-exempt.
+# species and breed live in the `pet` table — they are identity fields, not profile facts.
+# They never enter active_profile and cannot decay. Do NOT add them here.
+
+def get_recency_score(key: str, age_days: int, life_stage: str) -> float:
+    """Return recency score for a field. Decay-exempt keys always return 1.0 once filled."""
+    if key in DECAY_EXEMPT_KEYS:
+        return 1.0
+    modifier = LIFE_STAGE_DECAY_MODIFIER[life_stage]
+    effective_age = age_days * modifier
+    if effective_age <= 7:   return 1.0
+    if effective_age <= 14:  return 0.9
+    if effective_age <= 30:  return 0.7
+    if effective_age <= 60:  return 0.5
+    if effective_age <= 90:  return 0.4
+    return 0.3
+```
 
 | Data Age   | Recency Score |
 | ---------- | ------------- |
@@ -1142,7 +1109,10 @@ def compute_overall_depth_score(active_profile: list[dict]) -> float:
     if not filled:
         return 0.0
     scores = [compute_depth_score(row["value"]) for row in filled]
-    return min(sum(scores) / len(scores), 1.0)  # Cap at 1.0 for formula
+    return sum(scores) / len(scores)
+    # NOT capped at 1.0 — profiles where most entries have rich contextual detail
+    # can score above 1.0 on depth, giving a real boost to the final confidence score.
+    # The final Confidence Score is capped at 100% in the UI layer, not here.
 ```
 
 **Why not use an LLM for depth scoring?** An LLM judge would add ~500ms latency and ~$0.001 per call to every Aggregator update. Word count catches 80% of the quality signal for a fraction of the cost. LLM-based depth scoring can be added as a nightly batch refinement in a future iteration.
@@ -1150,36 +1120,49 @@ def compute_overall_depth_score(active_profile: list[dict]) -> float:
 ### 7.6 Confidence Bar Calculation — Complete Example
 
 ```
-Pet: Luna (Shiba Inu, 2 years — adult life stage)
-Snapshot: 5 Rank A items, 3 Rank B items, 2 Rank C items filled
+Pet: Luna (Shiba Inu, 2 years — adult life stage, decay modifier 0.75×)
+Schema: 7 Rank A items, 5 Rank B items, 6 Rank C items (max = 7×4 + 5×2 + 6×1 = 44 pts)
+Snapshot: 5 Rank A filled, 3 Rank B filled, 2 Rank C filled
 
-COVERAGE SCORE:
-  Rank A: 5/5 filled × 10 pts = 50
-  Rank B: 3/5 filled × 6 pts  = 18
-  Rank C: 2/5 filled × 4 pts  = 8
-  Total = 76 / 100 = 0.76
+─── COVERAGE SCORE (weighted 4:2:1) ───────────────────────────────────────
+  Rank A: 5/7 filled × 4 pts = 20 of 28 possible
+  Rank B: 3/5 filled × 2 pts =  6 of 10 possible
+  Rank C: 2/6 filled × 1 pt  =  2 of  6 possible
+  Weighted total = 28 / 44 = 0.636
 
-RECENCY SCORE:
-  chronic_illness: 90 days old   → 0.3 (adult modifier 0.75× → effective 67.5 days → maps to 0.5)
-  medications:     1 day old     → 1.0
-  diet_type:       14 days old   → 0.9
-  energy_level:    today         → 1.0
-  toilet_timing:   30 days old   → 0.7
-  ... (average across all filled keys)
-  Average recency = 0.74
+─── RECENCY SCORE (adult modifier: 0.75×) ──────────────────────────────────
+  chronic_illness:      90d × 0.75 = 67.5 effective → 0.4
+  medications:          1d                           → 1.0
+  diet_type:            14d                          → 0.9
+  neutered_spayed:      [decay-exempt]               → 1.0
+  vaccination_status:   [decay-exempt]               → 1.0
+  home_alone_frequency: 45d × 0.75 = 33.75 effective → 0.5
+  exercise_level:       7d                           → 1.0
+  current_weight:       10d                          → 0.9
+  personality:          60d × 0.75 = 45 effective   → 0.4
+  favorite_toys:        30d                          → 0.7
+  Average recency = (0.4+1.0+0.9+1.0+1.0+0.5+1.0+0.9+0.4+0.7) / 10 = 0.78
 
-DEPTH SCORE:
-  chronic_illness: "None" (1 word)              → 0.5
-  medications:     "Antibiotics for ear infection since March 15" (7 words) → 0.8
-  diet_type:       "Raw food twice daily" (4 words) → 0.5
-  energy_level:    "low/tired" (1 word)          → 0.5
-  toilet_timing:   "Regular, 3x daily" (3 words) → 0.5
-  Average depth = 0.56
+─── DEPTH SCORE (not capped at 1.0) ────────────────────────────────────────
+  chronic_illness:      "None" (1 word)                                   → 0.5
+  medications:          "Antibiotics for ear infection since March 15"    → 1.2 ✦ rich (since)
+  diet_type:            "Raw food twice daily" (4 words)                  → 0.5
+  neutered_spayed:      "Yes" (1 word)                                    → 0.5
+  vaccination_status:   "Up to date as of Jan 2025" (6 words)            → 0.8
+  home_alone_frequency: "8 hours on weekdays" (3 words)                  → 0.5
+  exercise_level:       "30 min walk daily, morning" (4 words)           → 0.5
+  current_weight:       "8.2kg" (1 word)                                 → 0.5
+  personality:          "Shy with strangers but playful at home" (7 words) → 0.8
+  favorite_toys:        "Squeaky ball, rope toy" (3 words)               → 0.5
+  Average depth = (0.5+1.2+0.5+0.5+0.8+0.5+0.5+0.5+0.8+0.5) / 10 = 0.63
 
-FINAL SCORE:
-  (0.76 × 0.4) + (0.74 × 0.3) + (0.56 × 0.3)
-  = 0.304 + 0.222 + 0.168
-  = 0.694 → 69% → 🟡 Yellow
+─── FINAL SCORE ─────────────────────────────────────────────────────────────
+  (0.636 × 0.4) + (0.78 × 0.3) + (0.63 × 0.3)
+  = 0.254 + 0.234 + 0.189
+  = 0.677 → 68% → 🟡 Yellow
+
+  Note: energy_level and appetite NOT included above — they are transient
+  state fields, shown separately in "Today's Status" widget (see §7.10).
 ```
 
 ### 7.7 Status Indicators
@@ -1195,6 +1178,101 @@ FINAL SCORE:
 - After every Aggregator update (real-time, per conversation)
 - After nightly batch job completes (passive extraction may fill gaps)
 - Time-based recalculation (a daily cron to decay scores even if no new conversation)
+
+### 7.9 Decay-Exempt Keys — Reference
+
+These keys score `recency = 1.0` permanently once filled. They represent one-time biological or medical facts that do not change after being set:
+
+| Key | Why exempt |
+|-----|-----------|
+| `neutered_spayed` | Irreversible surgical fact — once true, always true |
+| `vaccination_status` | The recorded vaccination status doesn't decay; product reminders for schedule updates are handled separately |
+
+> **`species` and `breed` are NOT in this table.** These fields live in the `pet` table, not `active_profile`. They are identity fields set at signup — they never enter the key-value active_profile store and therefore cannot be part of recency decay calculation. See Section 5.4 (pet vs active_profile distinction).
+
+> **Implementation:** `DECAY_EXEMPT_KEYS` set in §7.3. Used in `get_recency_score()`. Returns `1.0` immediately on key match, bypassing age/life-stage logic entirely.
+
+---
+
+### 7.10 Transient State — UI Handling
+
+`energy_level` and `appetite` are **excluded from the Confidence Bar entirely** — not from coverage only, but from recency and depth calculations as well. Including them would distort the bar: a dog that seemed "tired" yesterday would lower the recency score today for no clinically meaningful reason.
+
+**UI design (separation of concerns):**
+
+The Confidence Bar reflects **stable profile knowledge** only.
+
+Transient fields surface as a separate **"Today's Status"** widget, shown below the bar:
+
+```
+[Today's Status — from Luna's last message]
+⚡ Energy:    low / tired
+🍖 Appetite:  normal
+Last updated: 2 hours ago
+```
+
+- Widget greys out after 24 hours ("Status from yesterday")
+- Widget disappears after 3 days (independent of the confidence bar)
+- If no transient data exists: widget is hidden entirely — no empty state shown
+
+**Why not show transient state inside the bar?**
+The bar is a prompt to fill in stable information ("What's Luna's diet?"). Transient state is gathered passively from conversation — it doesn't need a gap-filling prompt. Mixing them would make the bar react to daily mood changes and lose its meaning as a "completeness" signal.
+
+---
+
+### 7.11 Cold-Start Baseline
+
+New users who just added a pet should not see a 0% bar. A 0% bar feels broken, not motivating — and it is technically inaccurate, since we know the pet's name and species from the onboarding form.
+
+**Rule:** The onboarding questionnaire (Section 14) asks at minimum **3 Rank A questions** before the first free-form chat session begins. These pre-populate `active_profile`, starting the bar at:
+
+```
+3 Rank A items filled × 4 pts = 12 pts
+Denominator = 44 pts
+Starting coverage = 12/44 = 27%
+```
+
+This puts new users directly in the 🟡 Yellow range, with a message:
+> *"Great start! Keep chatting to help me understand Luna better."*
+
+**Important:** Signup-form fields (name, species, breed, DOB) live in the `pet` table — **not** in `active_profile`. They do not count toward ranked coverage. Only answers that map to Rank A/B/C keys in `active_profile` count.
+
+Minimum 3 Rank A questions to ask at signup (in order):
+1. Does Luna have any chronic illnesses? → `chronic_illness`
+2. What does Luna eat? → `diet_type`
+3. Has Luna been spayed/neutered? → `neutered_spayed`
+
+---
+
+### 7.12 Schema Migration — New Fields Strategy
+
+When new Rank A/B/C fields are added to the schema, existing users' coverage scores would drop (more items in the denominator, same items filled). This punishes engaged users for schema growth and creates confusing UX ("Why did my bar drop?").
+
+**Soft rollout rule:**
+
+- New schema fields enter a **bonus bucket** for **30 days** after the schema update date
+- During the bonus window: filling the field **increases** the score; not filling it does **not decrease** the score (field excluded from denominator)
+- After 30 days: the field enters the standard denominator for all users
+- At transition: a gentle UI prompt surfaces — *"We've added new questions — answer them to keep Luna's profile strong."*
+
+```python
+BONUS_WINDOW_DAYS = 30
+
+def get_coverage_denominator(fields: list[dict], today: date) -> int:
+    """
+    Returns weighted denominator for coverage score.
+    Fields added within BONUS_WINDOW_DAYS of their schema_added_date
+    are excluded from denominator unless already filled.
+    """
+    total = 0
+    for field in fields:
+        days_since_added = (today - field["schema_added_date"]).days
+        if days_since_added >= BONUS_WINDOW_DAYS:
+            total += RANK_WEIGHTS[field["rank"]]  # {A: 4, B: 2, C: 1}
+    return total
+```
+
+> **MVP note:** For the initial schema, all fields are "day 0" — bonus window does not apply. The bonus window logic activates on the first schema update after launch.
 
 ---
 
@@ -1878,133 +1956,3 @@ Step 5: Ongoing (Confidence Bar: 🟢 maintenance)
 - **Predictive health signals:** Combine behavior patterns to suggest vet visits before problems become visible
 
 ---
-
-## 16. Architecture Decisions & PRD Gap Log
-
-This section documents decisions made when the system design diverged from (or improved upon) the PRD, and explains the rationale. Kept as a living record for the team.
-
-### 16.1 Agent 3: Deterministic vs LLM
-
-| | PRD | System Design (Prototype) | Rationale |
-|---|---|---|---|
-| **Agent 3 model** | Reasoning Model (LLM) | Deterministic code | Prototype speed + cost. Interface designed for clean LLM swap later. |
-
-The aggregate function in Section 5.3 has a clear interface (`newFact`, `currentEntry` → `action`). When upgrading to LLM, only the decision logic inside the function changes — surrounding pipeline is unchanged.
-
-### 16.2 Agent 2: Model Choice
-
-| | PRD | System Design (Prototype) | Rationale |
-|---|---|---|---|
-| **Agent 2 model** | Advanced model (GPT-4o / Claude Sonnet) | Mini model (GPT-4o-mini / Haiku) | Start cheap. After prototype, measure extraction quality on 100 sampled conversations and upgrade if error rate > 5%. |
-
-### 16.3 Confidence Bar Scope
-
-| | PRD | System Design | Rationale |
-|---|---|---|---|
-| **Scope** | Household-level (one bar for all pets) | Per-pet (separate bar per pet) | Per-pet is more useful to owners with multiple pets. A household aggregate can be derived from per-pet scores. Proposed improvement to PRD. |
-
-### 16.4 message_reading_key
-
-| | PRD | System Design | Decision |
-|---|---|---|---|
-| **Purpose** | Mark high-importance messages | Redundant with `intent_flag` from Layer 1 classifier | **Recommendation: remove in MVP.** Layer 1 already classifies intent before Agent 1 runs. `message_reading_key` adds no new information. If kept, treat it purely as a UI hint for higher agent attention weight. |
-
-### 16.5 relationship_context (PRD Addition)
-
-The PRD describes `compressed_history` as a single field covering both pet facts and user relationship dynamics. In this design, we split these into two distinct concepts:
-
-- `compressed_history` → **pet-centric:** what happened with Luna across sessions
-- `relationship_context` → **user-centric:** how this owner communicates, their emotional state, session history
-
-This split allows the Compressor to summarize pet facts independently of user behavior, and allows relationship context to be shared across multiple pets owned by the same user.
-
-### 16.6 Rank D (PRD Gap Fixed)
-
-The original system design was missing the PRD's Rank D ("Digging Deeper") information tier. This has been added to Section 8. Rank D items add precision to already-known Rank A/B facts (e.g., `diet_brand`, `medication_schedule`, `vet_name`).
-
-### 16.7 Japanese Language (PRD Gap — Prototype Deferral)
-
-The PRD specifies Japanese as the **primary language**. The prototype Agent 1 prompt template has been updated with Japanese-first character voice placeholders (e.g., 「元気そうですね～！」). Full Japanese prompt engineering (translation of all system prompts, Japanese entity patterns for regex gate, Japanese-language evaluation rubrics) is deferred to MVP phase.
-
-### 16.8 Privacy Disclosure for Passive Context Gathering (PRD Suggestion)
-
-The PRD does not explicitly address user consent for passive context gathering from Health/Food module logs. We flag this as a pre-launch requirement: users should be informed (and given opt-out control) that their Health/Food conversations contribute to the main chatbot's pet profile. This should be designed before any user testing involving real health data.
-
-### 16.9 Household vs Per-Pet Confidence Bar (PRD Improvement Proposal)
-
-**Our proposal:** Build per-pet confidence bars as the primary metric. Expose a household-level aggregate as a secondary computed metric (average of all pet scores in the household). This gives multi-pet households a single "how well do you know all your pets?" indicator while preserving per-pet granularity.
-
----
-
-## 17. Change Log — What We Changed and Why
-
-This section is a running log of every significant design decision made during the document evolution. Intended to help team members understand not just what the design is, but why it is the way it is.
-
-### 17.1 Agent 1 — Input Restructured
-
-| What changed | `inputs` table now explicitly lists: `pet` (object), `active_profile_rows`, `compressed_history`, `relationship_context`, `current_session`, `gap_list`, `user_message` |
-| --- | --- |
-| **Why** | Previous version listed inputs as a flat comma-separated string. Team was unclear which inputs existed and what each contained. Restructured to match the actual `build_agent_context()` function output, with each input individually defined. |
-| **Source of confusion** | `gap_list` was previously described as computed "in the Compressor" — this was wrong. Compressor never computes gaps. Gaps are computed by `build_agent_context()` and passed to Agent 1. Fixed. |
-
-### 17.2 Agent 1 — `entity_detected` Added to Output
-
-| What changed | Agent 1 now outputs `entity_detected: bool` in addition to `message`, `intent_flag`, `questions_asked_count` |
-| --- | --- |
-| **Why** | We needed a smarter gate for calling Agent 2. Regex catches obvious skips but can't judge context (e.g., "does she like kibble?" matches regex but contains no extractable fact). Agent 1, with full pet profile context, can judge whether something is a new fact worth extracting. `entity_detected: false` skips Agent 2 entirely. |
-| **How it fits** | Creates a two-gate filter: regex (cheap, fast, ~1ms) → Agent 1 entity_detected (smart, context-aware). Both gates must pass to call Agent 2. |
-
-### 17.3 Agent 1 — `message_reading_key` Removed from Inputs
-
-| What changed | `message_reading_key` boolean removed from Agent 1 inputs |
-| --- | --- |
-| **Why** | Redundant. Layer 1 intent classifier (Section 13.1) already runs BEFORE Agent 1 and sets `intent_flag = "medical"` on high-importance messages. Agent 1 already adjusts tone from `intent_flag`. Adding a second boolean carrying the same signal adds complexity with no benefit. |
-| **Risk** | None. Agent 1 already handles this via intent_flag. |
-
-### 17.4 Agent 2 — Clarified: `pet_id` Is Routing-Only, Never Sent to LLM
-
-| What changed | Explicit note added: `Compressor.run(message: str, pet_id: str)` — `pet_id` never reaches the LLM |
-| --- | --- |
-| **Why** | `pet_id` is needed to route extracted facts to the right Aggregator call. But the LLM itself should receive ONLY the user message + output schema. Sending pet_id to the LLM adds no value and could encourage the model to "fill in" context it doesn't have. |
-
-### 17.5 Agent 2 — `gap_list` Does NOT Belong Here
-
-| What changed | Explicit rationale added in Section 5.2 explaining why Agent 2 receives no gap_list, no pet profile, no history |
-| --- | --- |
-| **Why** | Agent 2 has one job: extract what the USER said. Not what we need. Not what we don't know. Pure extraction from the current message. Giving it the gap_list risks the model extracting "what we want to hear" rather than "what was actually said" — a subtle hallucination risk. The gap_list belongs to Agent 1 only, which uses it to ask smart follow-up questions. |
-
-### 17.6 Agent 2 — Entity Schema Expanded
-
-| What changed | Added new fields across all ranks: `neutered_spayed`, `vaccination_status` (Rank A); `current_weight`, `sleep_pattern` (Rank B, sleep_pattern was previously missing from schema); `behavioral_issues`, `social_behavior`, `sleep_location` (Rank C); `health_events` (Rank D). Rank E changed from `happiest_moment`/`unforgettable_memory` to `owner_nickname`, `favorite_activity`, `fears`, `comfort_items`. Added new Transient State category: `energy_level`, `appetite`. |
-| --- | --- |
-| **Why** | Original schema was missing clinically relevant fields. `neutered_spayed` and `vaccination_status` are critical medical baselines that any vet would ask first. `sleep_pattern` existed in UI labels but was missing from the extraction schema — a gap. Transient fields separated because they decay in 1-3 days and would distort the confidence bar's coverage score if treated as regular profile gaps. |
-
-### 17.7 Compressed History — Two Types Distinguished (`summary_type` Column)
-
-| What changed | `compressed_history` table now has `summary_type` column: `"session_compact"` (per N sessions, from raw messages) and `"longitudinal"` (weekly/monthly, from fact_log). Agent 1 receives both. |
-| --- | --- |
-| **Why** | These serve fundamentally different purposes. Session compact gives recent emotional/relationship context. Longitudinal gives long-term health trend narrative. They're built from different sources (raw messages vs. fact_log entries) and at different cadences. Storing them in the same table with a type column avoids creating a new table while keeping them cleanly separated. |
-| **Why raw messages for session_compact, not extracted entities?** | Entities give you WHAT was said. Raw messages preserve HOW — tone, uncertainty, owner anxiety, follow-up patterns. Summarizing only entities would produce a dry clinical summary that loses relationship dynamics. Agent 1 needs the emotional context, not just the fact list. |
-| **Why fact_log for longitudinal?** | Trends require timestamped structured data. Raw messages don't carry per-fact timestamps. fact_log does. You can't detect "Luna's energy mentions have increased over 3 months" from raw text — you need the structured extract. |
-
-### 17.8 User Relationship Context — Format Decision: NL Summary, Not Structured Schema
-
-| What changed | Explicit decision documented in Section 12.6: `user_relationship_context.summary` is a natural language paragraph (~100-150 words), not a structured key-value schema |
-| --- | --- |
-| **Why NL over structured schema?** | User behavior is nuanced and doesn't map cleanly to fixed fields. A structured schema (e.g., `{"tone": "anxious", "preferred_response_length": "short"}`) loses the relational context between attributes. A NL paragraph ("Owner tends to be anxious, especially about health, and prefers short reassuring replies in the evenings") is directly injectable into Agent 1's prompt without transformation. |
-| **How it's generated** | By the compaction job's second task (Section 12.6), which reads the same raw conversation messages as the session compact but looks for USER behavioral signals, not pet facts. NOT extracted per-message. |
-| **Storage** | One row per user. Overwritten on each compaction. This is the ONLY store in the system that is truly replaced rather than appended — because we only ever need the LATEST user behavioral summary, not a history of old ones. |
-
-### 17.9 Storage Strategy — Clarified Five Stores
-
-| What changed | Section 6.1 restructured to explicitly answer: what gets APPENDED, what gets UPSERTED, what gets OVERWRITTEN. Five stores clearly defined with write patterns. |
-| --- | --- |
-| **Why** | Previous Section 6 described only two layers (fact_log + active_profile). The team had questions about where conversation sessions, pet trends, and user profiles go. Now all five stores are explicitly framed. |
-| **Key clarification** | `conversation_log` and `fact_log` are pure append-only audit logs — they are NEVER read at conversation time. `active_profile` is the "current pet profile" — structured, one row per key. `compressed_history` holds pet NL narratives (two types). `user_relationship_context` holds the current user behavioral summary — the only store that is overwritten. |
-
-### 17.10 User Profile Extraction — via Compaction, Not Per-Message
-
-| What changed | Section 12.6 added: explains that user behavioral signals are NOT extracted per-message by Agent 2. They are inferred by the compaction job reading the same raw messages it uses for the session_compact summary. |
-| --- | --- |
-| **Why not per-message?** | A single message tells you nothing reliable about a user's communication style. The pattern across 20+ messages does. Per-message extraction would add LLM cost on every turn and produce noisy, unreliable individual observations. |
-| **The compaction job runs TWO tasks in one pass:** Task 1 → pet history compact (session_compact summary). Task 2 → user signal extraction (updates user_relationship_context). Same input (raw messages), different output schemas. |
